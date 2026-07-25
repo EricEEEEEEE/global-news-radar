@@ -1,11 +1,15 @@
-version: "1.1.0"
+version: "1.2.0"
 timezone: Asia/Singapore
 poll_seconds: 120
-heartbeat_seconds: 300
 freshness_minutes: 75
 future_tolerance_minutes: 5
 topic_cooldown_hours: 6
 topic_retention_days: 30
+item_retention_days: 7
+delivery_retention_days: 90
+lineage_max_gap_days: 7
+anchor_min_interval_minutes: 30
+anchor_daily_cap: 6
 corroboration_minutes: 20
 p1_window_minutes: 120
 p1_expiry_minutes: 180
@@ -18,10 +22,13 @@ telegram:
   monitor_thread_id: "0"
   max_visible_chars: 400
 runtime:
-  send_enabled: false
   baseline_on_first_run: true
   source_failure_alert_after: 3
+  source_failure_alert_rate: 0.5
+  source_failure_rate_min_calls: 4
+  source_health_window_hours: 6
   source_error_cooldown_hours: 12
+  source_retry_attempts: 2
   delivery_retry_minutes: 10
   delivery_max_attempts: 6
 llm:
@@ -70,6 +77,10 @@ discovery:
   interval_cycles: 5
   max_queries: 3
   gdelt_fallback: true
+  # Google News alone silences the radar whenever it rate-limits or reshapes its
+  # RSS: fall back to GDELT when discovery returns a thin batch, not only an
+  # empty one.
+  gdelt_min_items: 8
   major_sources:
     - Reuters
     - Associated Press
@@ -77,19 +88,82 @@ discovery:
     - Financial Times
     - CNBC
     - Wall Street Journal
-    - Nikkei Asia
+    - MarketWatch
+    - South China Morning Post
     - BBC
     - Al Jazeera
+  # Direct outlet feeds, so corroboration no longer depends on Google News
+  # surfacing the same story twice. Every URL below was probed from the VPS and
+  # returns parseable, dated entries.
+  feeds:
+    - id: cnbc_top
+      name: CNBC
+      url: https://www.cnbc.com/id/100003114/device/rss/rss.html
+      region: us
+      category_hint: discovery
+    - id: cnbc_economy
+      name: CNBC
+      url: https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258
+      region: us
+      category_hint: discovery
+    - id: marketwatch_realtime
+      name: MarketWatch
+      url: https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines
+      region: us
+      category_hint: discovery
+    - id: ft_home
+      name: Financial Times
+      url: https://www.ft.com/rss/home
+      region: global
+      category_hint: discovery
+    - id: bbc_business
+      name: BBC
+      url: https://feeds.bbci.co.uk/news/business/rss.xml
+      region: global
+      category_hint: discovery
+    - id: bbc_world
+      name: BBC
+      url: https://feeds.bbci.co.uk/news/world/rss.xml
+      region: global
+      category_hint: discovery
+    - id: aljazeera_all
+      name: Al Jazeera
+      url: https://www.aljazeera.com/xml/rss/all.xml
+      region: global
+      category_hint: discovery
+    - id: scmp_business
+      name: South China Morning Post
+      url: https://www.scmp.com/rss/92/feed
+      region: asia
+      category_hint: discovery
+    - id: investing_news
+      name: Investing.com
+      url: https://www.investing.com/rss/news.rss
+      region: global
+      category_hint: discovery
+    - id: coindesk
+      name: CoinDesk
+      url: https://www.coindesk.com/arc/outboundfeeds/rss/
+      region: global
+      category_hint: discovery
 structured:
   fmp_enabled: false
   interval_cycles: 5
+  # Percentage-point series only. Index-level releases (ISM, PMI) are
+  # deliberately excluded: their surprises are measured in index points, which
+  # the shared rate_surprise_pp threshold would read as a shock every month.
   macro_events:
     - consumer price index
     - cpi
+    - inflation rate
+    - core inflation rate
+    - pce price index
     - nonfarm payroll
     - non-farm payroll
+    - unemployment rate
     - gross domestic product
     - gdp
+    - interest rate decision
   mega_cap_symbols:
     - AAPL
     - MSFT
@@ -98,6 +172,8 @@ structured:
     - META
     - NVDA
     - TSLA
-  rate_surprise_pp: 0.3
+  # A 0.2pp miss on CPI or the unemployment rate already moves the curve; 0.3
+  # silently dropped most real macro surprises.
+  rate_surprise_pp: 0.2
   count_relative_surprise: 0.3
   earnings_surprise_ratio: 0.1

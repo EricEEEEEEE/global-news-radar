@@ -4,8 +4,10 @@ import email.utils
 import hashlib
 import html
 import json
+import logging
 import os
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -21,6 +23,41 @@ TRACKING_KEYS = {
     "gl",
     "ceid",
 }
+
+REDACTED = "***"
+_SECRET_VALUES: set[str] = set()
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)\b(apikey|api_key|key|token|access_token|secret|password|auth)"
+    r"=([^&\s\"'<>]+)"
+)
+_BOT_TOKEN_RE = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+
+
+def register_secrets(values: Iterable[str]) -> None:
+    """Remember credential values so they can be scrubbed from any output."""
+    for value in values:
+        text = str(value or "").strip()
+        if len(text) >= 8:
+            _SECRET_VALUES.add(text)
+
+
+def redact_secrets(value: object) -> str:
+    """Remove credentials from text before it is logged, stored or delivered."""
+    text = str(value or "")
+    if not text:
+        return text
+    for secret in _SECRET_VALUES:
+        if secret in text:
+            text = text.replace(secret, REDACTED)
+    text = _SECRET_QUERY_RE.sub(rf"\1={REDACTED}", text)
+    return _BOT_TOKEN_RE.sub(f"/bot{REDACTED}", text)
+
+
+class RedactingFormatter(logging.Formatter):
+    """Formatter that scrubs credentials from messages *and* tracebacks."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
 
 
 def utc_now() -> datetime:

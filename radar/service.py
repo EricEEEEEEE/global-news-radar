@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import html
 import json
 import logging
 import signal
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .delivery import TelegramDelivery
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
-from .policy import assess, is_fresh, is_quiet_window
+from .policy import assess, is_fresh, is_quiet_window, quiet_window_end
 from .render import render_p0, render_p1
 from .sources import (
     FmpCollector,
@@ -20,7 +21,7 @@ from .sources import (
     HttpClient,
     RssCollector,
 )
-from .store import RadarStore
+from .store import RadarStore, is_infra_event
 from .summarizer import LlmSummarizer
 from .util import (
     SGT,
@@ -29,6 +30,8 @@ from .util import (
     hamming_distance,
     json_dumps,
     normalize_title,
+    redact_secrets,
+    register_secrets,
     simhash64,
     stable_hash,
     strip_html,
@@ -51,16 +54,35 @@ class RadarService:
         self.root = root
         self.config = config
         self.env = env
+        register_secrets(
+            env.get(name, "")
+            for name in (
+                "FMP_API_KEY",
+                "TELEGRAM_BOT_TOKEN",
+                "LLM_API_KEY",
+            )
+        )
+        self.news_thread_id = env.get(
+            "TELEGRAM_NEWS_THREAD_ID",
+            str(config["telegram"]["news_thread_id"]),
+        )
+        self.monitor_thread_id = env.get(
+            "TELEGRAM_MONITOR_THREAD_ID",
+            str(config["telegram"]["monitor_thread_id"]),
+        )
         self.store = RadarStore(root / "state" / "radar.sqlite3")
         self.client = HttpClient(
             user_agent=env.get(
                 "RADAR_USER_AGENT",
                 f"global-news-radar/{__version__} "
                 "(+https://github.com/EricEEEEEEE/global-news-radar)",
-            )
+            ),
+            attempts=int(config["runtime"]["source_retry_attempts"]),
         )
         self.rss = RssCollector(self.client, self.store)
-        self.gnews = GoogleNewsCollector(self.rss)
+        self.gnews = GoogleNewsCollector(
+            self.rss, int(config["discovery"]["max_queries"])
+        )
         self.gdelt = GdeltCollector(self.client)
         self.fmp = FmpCollector(
             self.client,
@@ -75,14 +97,6 @@ class RadarService:
             timeout=int(config["llm"]["timeout_seconds"]),
             max_output_tokens=int(config["llm"]["max_output_tokens"]),
         )
-        self.news_thread_id = env.get(
-            "TELEGRAM_NEWS_THREAD_ID",
-            str(config["telegram"]["news_thread_id"]),
-        )
-        self.monitor_thread_id = env.get(
-            "TELEGRAM_MONITOR_THREAD_ID",
-            str(config["telegram"]["monitor_thread_id"]),
-        )
         self.delivery = TelegramDelivery(
             token=env.get("TELEGRAM_BOT_TOKEN", ""),
             chat_id=env.get("TELEGRAM_CHAT_ID", str(config["telegram"]["chat_id"])),
@@ -92,6 +106,7 @@ class RadarService:
         )
         self._cycle = int(self.store.get_meta("cycle_count", "0") or "0")
         self._stopping = False
+        self.readonly = False
         self.last_cycle_stats: dict[str, Any] = {}
 
     def close(self) -> None:
@@ -107,23 +122,53 @@ class RadarService:
         now: datetime,
         errors: list[dict[str, Any]],
     ) -> list[NewsItem]:
+        window_hours = float(self.config["runtime"]["source_health_window_hours"])
         try:
             items = callback()
-            self.store.source_success(source_id, now)
+            if not self.readonly:
+                self.store.source_success(source_id, now, window_hours)
             return items
         except Exception as exc:  # noqa: BLE001
-            count = self.store.source_failure(source_id, str(exc), now)
+            # Upstream error text carries the full request URL, and the FMP URL
+            # carries the API key. Redact before it reaches SQLite, the log file
+            # or a Telegram alert.
+            reason = redact_secrets(exc)
+            if self.readonly:
+                errors.append(
+                    {"source_id": source_id, "error": reason[:300], "failures": 0}
+                )
+                LOGGER.error(
+                    "source_failed source=%s error=%s", source_id, reason[:300]
+                )
+                return []
+            count = self.store.source_failure(source_id, reason, now, window_hours)
+            attempts, failures = self.store.source_window(source_id)
             errors.append(
-                {"source_id": source_id, "error": str(exc)[:300], "failures": count}
+                {
+                    "source_id": source_id,
+                    "error": reason[:300],
+                    "failures": count,
+                    "window_attempts": attempts,
+                    "window_failures": failures,
+                }
             )
-            LOGGER.exception("source_failed source=%s failures=%s", source_id, count)
+            LOGGER.error(
+                "source_failed source=%s failures=%s error=%s",
+                source_id,
+                count,
+                reason[:300],
+            )
             return []
 
-    def collect(self, now: datetime) -> tuple[list[NewsItem], list[dict[str, Any]]]:
+    def _collect_feeds(
+        self,
+        feeds: list[dict[str, Any]],
+        source_tier: str,
+        now: datetime,
+        errors: list[dict[str, Any]],
+    ) -> list[NewsItem]:
         items: list[NewsItem] = []
-        errors: list[dict[str, Any]] = []
-        first_collection = not self.store.baseline_complete()
-        for feed in self.config["official_feeds"]:
+        for feed in feeds:
             items.extend(
                 self._source_call(
                     str(feed["id"]),
@@ -131,7 +176,7 @@ class RadarService:
                         source_id=str(feed["id"]),
                         source_name=str(feed["name"]),
                         url=str(feed["url"]),
-                        source_tier="primary",
+                        source_tier=source_tier,
                         region=str(feed["region"]),
                         category_hint=str(feed["category_hint"]),
                         now=now,
@@ -140,20 +185,45 @@ class RadarService:
                     errors,
                 )
             )
+        return items
+
+    def collect(self, now: datetime) -> tuple[list[NewsItem], list[dict[str, Any]]]:
+        items: list[NewsItem] = []
+        errors: list[dict[str, Any]] = []
+        first_collection = not self.store.baseline_complete()
+        items.extend(
+            self._collect_feeds(
+                list(self.config["official_feeds"]), "primary", now, errors
+            )
+        )
 
         discovery_due = (
             first_collection
             or self._cycle % int(self.config["discovery"]["interval_cycles"]) == 0
         )
         if bool(self.config["discovery"]["enabled"]) and discovery_due:
-            discovery_items = self._source_call(
-                "gnews",
-                lambda: self.gnews.collect(now, now.astimezone(SGT)),
+            discovery_items = self._collect_feeds(
+                list(self.config["discovery"].get("feeds") or []),
+                "secondary",
                 now,
                 errors,
             )
+            discovery_items.extend(
+                self._source_call(
+                    "gnews",
+                    lambda: self.gnews.collect(now, now.astimezone(SGT)),
+                    now,
+                    errors,
+                )
+            )
             items.extend(discovery_items)
-            if not discovery_items and bool(self.config["discovery"]["gdelt_fallback"]):
+            # A thin batch is the symptom of a throttled or reshaped feed, and it
+            # is exactly when the fallback is needed; waiting for a fully empty
+            # batch meant the fallback almost never ran.
+            floor = int(self.config["discovery"].get("gdelt_min_items") or 0)
+            if len(discovery_items) < floor and bool(
+                self.config["discovery"]["gdelt_fallback"]
+            ):
                 items.extend(
                     self._source_call(
                         "gdelt",
@@ -205,14 +275,33 @@ class RadarService:
             now=now,
         )
 
+    def _corroborating_items(
+        self, item: NewsItem, assessment: Assessment, now: datetime
+    ) -> list[NewsItem]:
+        since = now - timedelta(minutes=int(self.config["corroboration_minutes"]))
+        found: dict[str, NewsItem] = {
+            observation.identity: observation
+            for observation in self.store.recent_observations(
+                assessment.event_key, since
+            )
+        }
+        fingerprint = simhash64(item.title)
+        for event_key, previous, observation in self.store.observation_cluster(
+            since, assessment.category
+        ):
+            if event_key == assessment.event_key:
+                continue
+            if hamming_distance(fingerprint, previous) <= 5:
+                found.setdefault(observation.identity, observation)
+        return list(found.values())
+
     def _qualify_event(
         self, item: NewsItem, assessment: Assessment, now: datetime
     ) -> AlertEvent | None:
-        self.store.add_observation(assessment.event_key, item, now)
-        observations = self.store.recent_observations(
-            assessment.event_key,
-            now - timedelta(minutes=int(self.config["corroboration_minutes"])),
+        self.store.add_observation(
+            assessment.event_key, item, now, simhash64(item.title)
         )
+        observations = self._corroborating_items(item, assessment, now)
         unique_sources = {observation.source.lower() for observation in observations}
         if assessment.requires_corroboration and len(unique_sources) < 2:
             LOGGER.info(
@@ -246,6 +335,10 @@ class RadarService:
             now=now,
         )
         for event_key in message.event_keys:
+            # Data-source alerts share the delivery path but are not market
+            # events: they must not enter the topic ledger or the export.
+            if is_infra_event(event_key):
+                continue
             observation_rows = self.store.recent_observations(
                 event_key, now - timedelta(hours=6)
             )
@@ -306,7 +399,8 @@ class RadarService:
             )
             return True
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("delivery_failed level=%s", message.level)
+            reason = redact_secrets(exc)
+            LOGGER.error("delivery_failed level=%s error=%s", message.level, reason)
             self.store.queue_delivery(
                 message,
                 thread_id=thread_id,
@@ -314,7 +408,7 @@ class RadarService:
                 + timedelta(
                     minutes=int(self.config["runtime"]["delivery_retry_minutes"])
                 ),
-                error=str(exc),
+                error=reason,
             )
             return False
 
@@ -357,23 +451,36 @@ class RadarService:
                     + timedelta(
                         minutes=int(self.config["runtime"]["delivery_retry_minutes"])
                     ),
-                    str(exc),
+                    redact_secrets(exc),
                 )
         return completed
 
     def _source_error_alerts(self, errors: list[dict[str, Any]], now: datetime) -> None:
         threshold = int(self.config["runtime"]["source_failure_alert_after"])
         cooldown = float(self.config["runtime"]["source_error_cooldown_hours"])
+        rate_threshold = float(self.config["runtime"]["source_failure_alert_rate"])
+        rate_min_attempts = int(self.config["runtime"]["source_failure_rate_min_calls"])
         for error in errors:
-            if int(error["failures"]) < threshold:
+            attempts = int(error.get("window_attempts") or 0)
+            failures = int(error.get("window_failures") or 0)
+            rate = failures / attempts if attempts else 0.0
+            # A source that fails one call in three never reaches a consecutive
+            # failure count of 3, so the rate is a second, independent trigger.
+            flapping = attempts >= rate_min_attempts and rate >= rate_threshold
+            if int(error["failures"]) < threshold and not flapping:
                 continue
             source_id = str(error["source_id"])
             if not self.store.source_alert_due(source_id, now, cooldown):
                 continue
+            detail = (
+                f"连续失败 {int(error['failures'])} 次"
+                if not flapping
+                else f"{attempts} 次调用失败 {failures} 次（{rate:.0%}）"
+            )
             text = (
                 "⚠️ <b>新闻雷达数据源异常</b>\n"
-                f"<blockquote>{source_id} 连续失败 {error['failures']} 次\n"
-                f"{str(error['error'])[:180]}</blockquote>\n"
+                f"<blockquote>{html.escape(source_id)} {detail}\n"
+                f"{html.escape(redact_secrets(error['error'])[:180])}</blockquote>\n"
                 f"<i>{now.astimezone(SGT).strftime('%Y-%m-%d %H:%M')} SGT · "
                 f"global-news-radar/{__version__}</i>"
             )
@@ -389,12 +496,9 @@ class RadarService:
             if self._deliver_or_queue(message, self.monitor_thread_id, now):
                 self.store.mark_source_alerted(source_id, now)
 
-    def run_once(self, now: datetime | None = None) -> dict[str, Any]:
-        now = now or utc_now()
-        self._cycle += 1
-        self.store.set_meta("cycle_count", str(self._cycle), now)
-        retries = self.retry_due_deliveries(now)
-        items, errors = self.collect(now)
+    def _freshness_filter(
+        self, items: list[NewsItem], now: datetime
+    ) -> tuple[list[NewsItem], dict[str, int]]:
         fresh: list[NewsItem] = []
         rejected: dict[str, int] = {}
         for item in items:
@@ -408,6 +512,63 @@ class RadarService:
                 rejected[reason] = rejected.get(reason, 0) + 1
                 continue
             fresh.append(item)
+        return fresh, rejected
+
+    def inspect(self, now: datetime | None = None) -> dict[str, Any]:
+        """Report what the radar sees right now without consuming any state.
+
+        A plain `once` marks every fresh headline seen, so running it by hand
+        costs the daemon that batch of news. This path answers the same
+        question and writes nothing: no seen_items, no cycle counter, no ETag
+        cache, no heartbeat, no delivery.
+        """
+        now = now or utc_now()
+        self.readonly = True
+        self.rss.readonly = True
+        try:
+            items, errors = self.collect(now)
+            fresh, rejected = self._freshness_filter(items, now)
+            preview: list[dict[str, Any]] = []
+            for item in fresh:
+                assessment = assess(item, self.config)
+                if assessment is None:
+                    continue
+                preview.append(
+                    {
+                        "level": assessment.level,
+                        "category": assessment.category,
+                        "event_key": assessment.event_key,
+                        "source": item.source,
+                        "title": item.title[:160],
+                        "requires_corroboration": assessment.requires_corroboration,
+                    }
+                )
+        finally:
+            self.readonly = False
+            self.rss.readonly = False
+        stats = {
+            "status": "readonly",
+            "fetched": len(items),
+            "fresh": len(fresh),
+            "eligible": len(preview),
+            "rejected": rejected,
+            "source_errors": errors,
+            "preview": preview[:25],
+        }
+        LOGGER.info("readonly_cycle %s", json_dumps({**stats, "preview": len(preview)}))
+        return stats
+
+    def run_once(
+        self, now: datetime | None = None, *, readonly: bool = False
+    ) -> dict[str, Any]:
+        if readonly:
+            return self.inspect(now)
+        now = now or utc_now()
+        self._cycle += 1
+        self.store.set_meta("cycle_count", str(self._cycle), now)
+        retries = self.retry_due_deliveries(now)
+        items, errors = self.collect(now)
+        fresh, rejected = self._freshness_filter(items, now)
 
         first_run = not self.store.baseline_complete()
         if first_run and bool(self.config["runtime"]["baseline_on_first_run"]):
@@ -429,59 +590,13 @@ class RadarService:
         p0_events: list[AlertEvent] = []
         new_items = 0
         for item in fresh:
-            assessment = assess(item, self.config)
-            if assessment is None:
-                if not self.store.item_seen(item.identity):
-                    self._mark_item(item, now)
-                continue
-            # Add an observation before near-duplicate suppression so a second
-            # independent outlet can corroborate a secondary-source P0.
-            event = self._qualify_event(item, assessment, now)
-            near_duplicate = self._is_near_duplicate(item, now)
-            if near_duplicate and not (
-                event is not None and assessment.requires_corroboration
-            ):
-                continue
-            self._mark_item(item, now)
-            new_items += 1
-            allowed, reason = self.store.topic_decision(
-                event_key=assessment.event_key,
-                material_hash=assessment.material_hash,
-                level=assessment.level,
-                now=now,
-                cooldown_hours=float(self.config["topic_cooldown_hours"]),
-            )
-            if not allowed:
-                LOGGER.info(
-                    "topic_suppressed event=%s reason=%s", assessment.event_key, reason
-                )
-                continue
-            if event is None:
-                continue
-            lineage_allowed, lineage_reason, lineage_day = self.store.lineage_decision(
-                topic_anchor=assessment.topic_anchor,
-                material_hash=assessment.material_hash,
-                now=now,
-            )
-            if not lineage_allowed:
-                LOGGER.info(
-                    "lineage_suppressed anchor=%s reason=%s",
-                    assessment.topic_anchor,
-                    lineage_reason,
-                )
-                continue
-            assessment.lineage_day = lineage_day
-            if assessment.level == "P0":
-                p0_events.append(event)
-            else:
-                self.store.buffer_p1(
-                    event_key=assessment.event_key,
-                    item=event.primary,
-                    assessment=assessment.to_dict(),
-                    now=now,
-                    expires_at=now
-                    + timedelta(minutes=int(self.config["p1_expiry_minutes"])),
-                )
+            try:
+                new_items += self._process_item(item, now, p0_events)
+            except Exception:  # noqa: BLE001
+                # One malformed headline must not abort the cycle: every other
+                # item in this batch has already been marked seen and would be
+                # lost for good.
+                LOGGER.exception("item_failed identity=%s", item.identity)
 
         quiet = is_quiet_window(
             now,
@@ -494,25 +609,12 @@ class RadarService:
             unique_p0[event.assessment.event_key] = event
         p0_events = list(unique_p0.values())
         for event in p0_events:
-            summary = self.summarizer.summarize(event)
-            message = render_p0(
-                event,
-                summary,
-                now,
-                int(self.config["telegram"]["max_visible_chars"]),
-            )
-            if quiet:
-                local = now.astimezone(SGT)
-                quiet_end = local.replace(hour=21, minute=30, second=0, microsecond=0)
-                self.store.queue_delivery(
-                    message,
-                    thread_id=self.news_thread_id,
-                    next_retry_at=quiet_end.astimezone(now.tzinfo),
-                    error="quiet_window",
+            try:
+                sent += self._publish_p0(event, now, quiet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "p0_render_failed event=%s", event.assessment.event_key
                 )
-                continue
-            if self._deliver_or_queue(message, self.news_thread_id, now):
-                sent += 1
 
         if not quiet:
             p1_rows = self.store.ready_p1(
@@ -533,11 +635,18 @@ class RadarService:
                     now,
                     int(self.config["telegram"]["max_visible_chars"]),
                 )
-                if self._deliver_or_queue(message, self.news_thread_id, now):
+                if self._deliver_or_queue(
+                    message, self.news_thread_id, now
+                ):
                     sent += 1
 
         self._source_error_alerts(errors, now)
-        self.store.prune(now, int(self.config["topic_retention_days"]))
+        self.store.prune(
+            now,
+            int(self.config["topic_retention_days"]),
+            item_retention_days=int(self.config["item_retention_days"]),
+            delivery_retention_days=int(self.config["delivery_retention_days"]),
+        )
         pending_count, deadletter_count = self.store.pending_counts(
             int(self.config["runtime"]["delivery_max_attempts"])
         )
@@ -563,6 +672,89 @@ class RadarService:
         }
         self._finish_cycle(stats, now)
         return stats
+
+    def _process_item(
+        self, item: NewsItem, now: datetime, p0_events: list[AlertEvent]
+    ) -> int:
+        assessment = assess(item, self.config)
+        if assessment is None:
+            if not self.store.item_seen(item.identity):
+                self._mark_item(item, now)
+            return 0
+        # Add an observation before near-duplicate suppression so a second
+        # independent outlet can corroborate a secondary-source P0.
+        event = self._qualify_event(item, assessment, now)
+        near_duplicate = self._is_near_duplicate(item, now)
+        if near_duplicate and not (
+            event is not None and assessment.requires_corroboration
+        ):
+            return 0
+        self._mark_item(item, now)
+        allowed, reason = self.store.topic_decision(
+            event_key=assessment.event_key,
+            material_hash=assessment.material_hash,
+            level=assessment.level,
+            now=now,
+            cooldown_hours=float(self.config["topic_cooldown_hours"]),
+        )
+        if not allowed:
+            LOGGER.info(
+                "topic_suppressed event=%s reason=%s", assessment.event_key, reason
+            )
+            return 1
+        if event is None:
+            return 1
+        lineage_allowed, lineage_reason, lineage_day = self.store.lineage_decision(
+            topic_anchor=assessment.topic_anchor,
+            material_hash=assessment.material_hash,
+            now=now,
+            max_gap_days=float(self.config["lineage_max_gap_days"]),
+            min_interval_minutes=float(self.config["anchor_min_interval_minutes"]),
+            daily_cap=int(self.config["anchor_daily_cap"]),
+        )
+        if not lineage_allowed:
+            LOGGER.info(
+                "lineage_suppressed anchor=%s reason=%s",
+                assessment.topic_anchor,
+                lineage_reason,
+            )
+            return 1
+        assessment.lineage_day = lineage_day
+        if assessment.level == "P0":
+            p0_events.append(event)
+        else:
+            self.store.buffer_p1(
+                event_key=assessment.event_key,
+                item=event.primary,
+                assessment=assessment.to_dict(),
+                now=now,
+                expires_at=now
+                + timedelta(minutes=int(self.config["p1_expiry_minutes"])),
+            )
+        return 1
+
+    def _publish_p0(self, event: AlertEvent, now: datetime, quiet: bool) -> int:
+        summary = self.summarizer.summarize(event)
+        message = render_p0(
+            event,
+            summary,
+            now,
+            int(self.config["telegram"]["max_visible_chars"]),
+        )
+        if quiet:
+            quiet_end = quiet_window_end(now, str(self.config["quiet_window"]["end"]))
+            self.store.queue_delivery(
+                message,
+                thread_id=self.news_thread_id,
+                next_retry_at=quiet_end.astimezone(now.tzinfo),
+                error="quiet_window",
+            )
+            return 0
+        if self._deliver_or_queue(
+            message, self.news_thread_id, now
+        ):
+            return 1
+        return 0
 
     def _finish_cycle(self, stats: dict[str, Any], now: datetime) -> None:
         self.last_cycle_stats = stats
@@ -603,8 +795,19 @@ def check_health(root: Path, max_age_seconds: int = 600) -> tuple[bool, dict[str
     path = root / "state" / "heartbeat.json"
     if not path.exists():
         return False, {"status": "missing_heartbeat", "path": str(path)}
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    timestamp = datetime.fromisoformat(str(payload["timestamp"]))
+    # The health check is what the watchdog trusts, so a half-written or
+    # corrupt heartbeat has to read as unhealthy, never as a crash.
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        timestamp = datetime.fromisoformat(str(payload["timestamp"]))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return False, {
+            "status": "unreadable_heartbeat",
+            "path": str(path),
+            "error": str(exc)[:200],
+        }
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
     age = (utc_now() - timestamp).total_seconds()
     deadletters = int(payload.get("stats", {}).get("deadletter_deliveries", 0))
     healthy = age <= max_age_seconds and deadletters == 0

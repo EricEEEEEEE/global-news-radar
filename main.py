@@ -5,11 +5,12 @@ import argparse
 import json
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from radar.config import load_config
 from radar.service import RadarService, check_health
-from radar.util import load_env
+from radar.util import RedactingFormatter, load_env, register_secrets
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     once = sub.add_parser("once", help="run one collection cycle")
     once.add_argument("--send", action="store_true")
+    once.add_argument(
+        "--readonly",
+        action="store_true",
+        help="inspect a cycle without consuming state: nothing is marked seen",
+    )
 
     run = sub.add_parser("run", help="run Supervisor-owned loop")
     run.add_argument("--send", action="store_true")
@@ -38,13 +44,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def configure_logging(root: Path, verbose: bool) -> None:
     root.joinpath("logs").mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(sys.stdout),
+        RotatingFileHandler(
+            root / "logs" / "radar.log",
+            maxBytes=8 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ]
+    # A third-party library logging a failed request would otherwise write the
+    # full URL, API key included, into a file Supervisor keeps for weeks.
+    formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    for handler in handlers:
+        handler.setFormatter(formatter)
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(root / "logs" / "radar.log", encoding="utf-8"),
-        ],
+        handlers=handlers,
     )
 
 
@@ -55,6 +71,16 @@ def main() -> int:
     env_path = args.env_file or root / ".env"
     config = load_config(config_path)
     env = load_env(env_path)
+    # Register before the first log line, not after the service is built, so
+    # nothing can leak in the window between startup and construction.
+    register_secrets(
+        env.get(name, "")
+        for name in (
+            "FMP_API_KEY",
+            "TELEGRAM_BOT_TOKEN",
+            "LLM_API_KEY",
+        )
+    )
     configure_logging(root, args.verbose)
 
     if args.command == "health":
@@ -71,7 +97,8 @@ def main() -> int:
     )
     try:
         if args.command == "once":
-            print(json.dumps(service.run_once(), ensure_ascii=False, indent=2))
+            stats = service.run_once(readonly=bool(args.readonly))
+            print(json.dumps(stats, ensure_ascii=False, indent=2))
             return 0
         if args.command == "run":
             service.run_forever()

@@ -41,7 +41,7 @@ def _link(node: Any) -> str:
 
 
 class HttpClient:
-    def __init__(self, user_agent: str, timeout: int = 18):
+    def __init__(self, user_agent: str, timeout: int = 18, attempts: int = 2):
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -53,9 +53,23 @@ class HttpClient:
             }
         )
         self.timeout = timeout
+        self.attempts = max(1, attempts)
+
+    def request(self, url: str, **kwargs: Any) -> requests.Response:
+        """GET with a short retry, because one dropped TCP connection to a
+        central-bank feed otherwise costs a whole polling cycle of coverage."""
+        last: Exception | None = None
+        for attempt in range(self.attempts):
+            try:
+                return self.session.get(url, timeout=self.timeout, **kwargs)
+            except requests.RequestException as exc:
+                last = exc
+                if attempt + 1 < self.attempts:
+                    LOGGER.warning("http_retry url=%s attempt=%s", url, attempt + 1)
+        raise last if last else RuntimeError("request failed")
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
-        response = self.session.get(url, timeout=self.timeout, **kwargs)
+        response = self.request(url, **kwargs)
         response.raise_for_status()
         return response
 
@@ -64,6 +78,10 @@ class RssCollector:
     def __init__(self, client: HttpClient, store: RadarStore):
         self.client = client
         self.store = store
+        # An inspection run must not consume the daemon's conditional-GET
+        # cache: storing an ETag here would make the next real poll a 304 and
+        # silently drop that batch of headlines.
+        self.readonly = False
 
     def collect(
         self,
@@ -77,24 +95,24 @@ class RssCollector:
         now: datetime,
     ) -> list[NewsItem]:
         headers: dict[str, str] = {}
-        etag = self.store.get_meta(f"etag:{source_id}")
-        modified = self.store.get_meta(f"modified:{source_id}")
-        if etag:
-            headers["If-None-Match"] = etag
-        if modified:
-            headers["If-Modified-Since"] = modified
-        response = self.client.session.get(
-            url, headers=headers, timeout=self.client.timeout
-        )
+        if not self.readonly:
+            etag = self.store.get_meta(f"etag:{source_id}")
+            modified = self.store.get_meta(f"modified:{source_id}")
+            if etag:
+                headers["If-None-Match"] = etag
+            if modified:
+                headers["If-Modified-Since"] = modified
+        response = self.client.request(url, headers=headers)
         if response.status_code == 304:
             return []
         response.raise_for_status()
-        if response.headers.get("ETag"):
-            self.store.set_meta(f"etag:{source_id}", response.headers["ETag"], now)
-        if response.headers.get("Last-Modified"):
-            self.store.set_meta(
-                f"modified:{source_id}", response.headers["Last-Modified"], now
-            )
+        if not self.readonly:
+            if response.headers.get("ETag"):
+                self.store.set_meta(f"etag:{source_id}", response.headers["ETag"], now)
+            if response.headers.get("Last-Modified"):
+                self.store.set_meta(
+                    f"modified:{source_id}", response.headers["Last-Modified"], now
+                )
         root = SafeET.fromstring(response.content)
         entries = [
             node
@@ -151,12 +169,13 @@ def discovery_queries(now_sgt: datetime) -> list[tuple[str, str]]:
 
 
 class GoogleNewsCollector:
-    def __init__(self, rss: RssCollector):
+    def __init__(self, rss: RssCollector, max_queries: int = 3):
         self.rss = rss
+        self.max_queries = max(1, max_queries)
 
     def collect(self, now: datetime, now_sgt: datetime) -> list[NewsItem]:
         result: list[NewsItem] = []
-        for query_id, query in discovery_queries(now_sgt):
+        for query_id, query in discovery_queries(now_sgt)[: self.max_queries]:
             url = (
                 "https://news.google.com/rss/search?q="
                 f"{quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"

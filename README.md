@@ -13,7 +13,8 @@ manager, or trading bot.
 ## What it does
 
 - Polls central-bank and regulator RSS feeds every two minutes.
-- Runs lightweight discovery through Google News RSS, with GDELT as fallback.
+- Runs discovery across a configurable set of commercial news RSS feeds plus
+  Google News, falling back to GDELT only when the batch comes back thin.
 - Supports optional structured macro and earnings data from FMP.
 - Applies deterministic P0/P1 rules before any LLM is called.
 - Requires independent corroboration for high-impact claims from secondary media.
@@ -67,7 +68,17 @@ LLM_MODEL=
 
 Use topic ID `0` when the target chat does not use Telegram forum topics.
 
-Run one safe collection cycle without sending:
+Inspect one cycle without touching state — nothing is marked seen, no heartbeat
+is written, and the conditional-GET cache is left alone, so this is safe to run
+against a live deployment:
+
+```bash
+.venv/bin/python main.py once --readonly
+```
+
+Run one full cycle without sending. This does not send Telegram messages, but it
+*does* consume state: items are marked seen and topic cooldowns advance. Running
+it against a running daemon's state directory makes that daemon skip those items.
 
 ```bash
 .venv/bin/python main.py once
@@ -121,10 +132,15 @@ Telegram credentials and routes belong in `.env`, never in tracked configuration
 - `state/radar_events.jsonl` — sent-event export for downstream briefs.
 - `outbox/latest.html` — last attempted Telegram HTML.
 - `outbox/latest.json` — event keys, sources, VisualSpec, delivery state, and message ID.
-- `logs/radar.log` — runtime log.
+- `logs/radar.log` — runtime log, self-rotating at 8 MB × 5 files.
 
 Delivery state is recorded only after Telegram confirms success. Failed sends enter
 a bounded retry queue; dead letters make the health command fail.
+
+Every log line, alert body, and heartbeat passes through a redaction filter: URL
+query credentials and any token loaded from `.env` are replaced with `***`, so a
+failing request cannot write an API key into a file or a chat message.
+`item_retention_days` and `delivery_retention_days` bound SQLite and outbox growth.
 
 ## Visual contract
 

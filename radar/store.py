@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS observations (
     event_key TEXT NOT NULL,
     source TEXT NOT NULL,
     item_json TEXT NOT NULL,
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    simhash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_observations_event_time
     ON observations(event_key, observed_at);
@@ -57,7 +58,9 @@ CREATE TABLE IF NOT EXISTS topic_lineage (
     first_date_sgt TEXT NOT NULL,
     last_date_sgt TEXT NOT NULL,
     last_sent_at TEXT NOT NULL,
-    day_number INTEGER NOT NULL DEFAULT 1
+    day_number INTEGER NOT NULL DEFAULT 1,
+    sends_today INTEGER NOT NULL DEFAULT 0,
+    sends_date_sgt TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS p1_buffer (
@@ -93,9 +96,21 @@ CREATE TABLE IF NOT EXISTS source_health (
     last_success_at TEXT,
     last_failure_at TEXT,
     last_error TEXT NOT NULL DEFAULT '',
-    last_alert_at TEXT
+    last_alert_at TEXT,
+    window_start_at TEXT,
+    window_attempts INTEGER NOT NULL DEFAULT 0,
+    window_failures INTEGER NOT NULL DEFAULT 0
 );
 """
+
+
+# Infrastructure alerts travel through the same delivery path as market events.
+# They must never reach seen_topics or the exported market-event ledger.
+INFRA_EVENT_PREFIX = "source-error:"
+
+
+def is_infra_event(event_key: str) -> bool:
+    return event_key.startswith(INFRA_EVENT_PREFIX)
 
 
 def _iso(value: datetime) -> str:
@@ -109,7 +124,33 @@ class RadarStore:
         self.connection = sqlite3.connect(path, timeout=20)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        self._migrate()
         self.connection.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        additions = {
+            "topic_lineage": (
+                ("sends_today", "INTEGER NOT NULL DEFAULT 0"),
+                ("sends_date_sgt", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "source_health": (
+                ("window_start_at", "TEXT"),
+                ("window_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("window_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ),
+            "observations": (("simhash", "TEXT NOT NULL DEFAULT ''"),),
+        }
+        for table, columns in additions.items():
+            existing = {
+                str(row["name"])
+                for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            for name, definition in columns:
+                if name not in existing:
+                    self.connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
 
     def close(self) -> None:
         self.connection.close()
@@ -189,13 +230,17 @@ class RadarStore:
         self.connection.commit()
 
     def add_observation(
-        self, event_key: str, item: NewsItem, observed_at: datetime
+        self,
+        event_key: str,
+        item: NewsItem,
+        observed_at: datetime,
+        simhash: str = "",
     ) -> None:
         self.connection.execute(
             """
             INSERT OR IGNORE INTO observations(
-                identity, event_key, source, item_json, observed_at
-            ) VALUES(?, ?, ?, ?, ?)
+                identity, event_key, source, item_json, observed_at, simhash
+            ) VALUES(?, ?, ?, ?, ?, ?)
             """,
             (
                 item.identity,
@@ -203,6 +248,7 @@ class RadarStore:
                 item.source,
                 json_dumps(item.to_dict()),
                 _iso(observed_at),
+                simhash,
             ),
         )
         self.connection.commit()
@@ -218,6 +264,51 @@ class RadarStore:
         ).fetchall()
         return [NewsItem.from_dict(json.loads(row["item_json"])) for row in rows]
 
+    def observation_cluster(
+        self, since: datetime, category: str
+    ) -> list[tuple[str, str, NewsItem]]:
+        """Observations in one category, for near-duplicate corroboration.
+
+        Two outlets covering the same event do not always produce the same
+        event_key — one may name an extra country the other omits — so exact-key
+        matching alone loses real second-source confirmations.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT event_key, simhash, item_json FROM observations
+            WHERE observed_at>=? AND event_key LIKE ? AND simhash<>''
+            ORDER BY observed_at DESC LIMIT 400
+            """,
+            (_iso(since), f"{category}:%"),
+        ).fetchall()
+        return [
+            (
+                str(row["event_key"]),
+                str(row["simhash"]),
+                NewsItem.from_dict(json.loads(row["item_json"])),
+            )
+            for row in rows
+        ]
+
+    def event_key_pending(self, event_key: str) -> bool:
+        """True when this event is already sitting in the delivery queue.
+
+        seen_topics is only written after a successful send, so during the quiet
+        window or a Telegram outage nothing else stops a second phrasing of the
+        same event from being queued a second time.
+        """
+        return (
+            self.connection.execute(
+                """
+                SELECT 1 FROM pending_delivery p
+                JOIN json_each(json_extract(p.message_json, '$.event_keys')) k
+                WHERE k.value = ? LIMIT 1
+                """,
+                (event_key,),
+            ).fetchone()
+            is not None
+        )
+
     def topic_decision(
         self,
         *,
@@ -227,6 +318,8 @@ class RadarStore:
         now: datetime,
         cooldown_hours: float,
     ) -> tuple[bool, str]:
+        if self.event_key_pending(event_key):
+            return False, "already_queued"
         row = self.connection.execute(
             "SELECT * FROM seen_topics WHERE event_key=?", (event_key,)
         ).fetchone()
@@ -284,6 +377,9 @@ class RadarStore:
         topic_anchor: str,
         material_hash: str,
         now: datetime,
+        max_gap_days: float = 7.0,
+        min_interval_minutes: float = 30.0,
+        daily_cap: int = 6,
     ) -> tuple[bool, str, int]:
         if not topic_anchor:
             return True, "no_anchor", 1
@@ -293,6 +389,23 @@ class RadarStore:
         if not row:
             return True, "new_lineage", 1
         last_sent = datetime.fromisoformat(str(row["last_sent_at"]))
+        # Without an upper bound a dormant anchor keeps counting calendar days,
+        # so an unrelated recurrence months later renders as 【Day 43】.
+        if max_gap_days > 0 and now - last_sent >= timedelta(days=max_gap_days):
+            return True, "lineage_expired", 1
+        # material_update alone re-fires whenever a second outlet quotes one more
+        # number, so the same story can push repeatedly within minutes.
+        if min_interval_minutes > 0 and now - last_sent < timedelta(
+            minutes=min_interval_minutes
+        ):
+            return False, "anchor_min_interval", int(row["day_number"])
+        local_today = now.astimezone(SGT).date().isoformat()
+        if (
+            daily_cap > 0
+            and str(row["sends_date_sgt"] or "") == local_today
+            and int(row["sends_today"] or 0) >= daily_cap
+        ):
+            return False, "anchor_daily_cap", int(row["day_number"])
         same_material = str(row["material_hash"]) == material_hash
         if same_material and now - last_sent < timedelta(hours=24):
             return False, "same_fact_24h", int(row["day_number"])
@@ -316,18 +429,16 @@ class RadarStore:
         if not topic_anchor:
             return
         local_date = now.astimezone(SGT).date().isoformat()
-        existing = self.connection.execute(
-            "SELECT material_hash FROM topic_lineage WHERE topic_anchor=?",
-            (topic_anchor,),
-        ).fetchone()
-        reset = existing is not None and str(existing["material_hash"]) == material_hash
-        first_date = local_date if reset and day_number == 1 else None
+        # Day 1 always means "this lineage starts today", whatever caused the
+        # restart (fresh recurrence or an expired anchor).
+        first_date = local_date if day_number == 1 else None
         self.connection.execute(
             """
             INSERT INTO topic_lineage(
                 topic_anchor, event_key, material_hash, first_date_sgt,
-                last_date_sgt, last_sent_at, day_number
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                last_date_sgt, last_sent_at, day_number,
+                sends_today, sends_date_sgt
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(topic_anchor) DO UPDATE SET
                 event_key=excluded.event_key,
                 material_hash=excluded.material_hash,
@@ -337,7 +448,13 @@ class RadarStore:
                 END,
                 last_date_sgt=excluded.last_date_sgt,
                 last_sent_at=excluded.last_sent_at,
-                day_number=excluded.day_number
+                day_number=excluded.day_number,
+                sends_today=CASE
+                    WHEN topic_lineage.sends_date_sgt = excluded.sends_date_sgt
+                    THEN topic_lineage.sends_today + 1
+                    ELSE 1
+                END,
+                sends_date_sgt=excluded.sends_date_sgt
             """,
             (
                 topic_anchor,
@@ -347,6 +464,7 @@ class RadarStore:
                 local_date,
                 _iso(now),
                 day_number,
+                local_date,
                 first_date,
                 first_date,
             ),
@@ -514,7 +632,39 @@ class RadarStore:
         ).fetchone()
         return int(row["total"] or 0), int(row["dead"] or 0)
 
-    def source_success(self, source_id: str, now: datetime) -> None:
+    def _bump_window(
+        self, source_id: str, now: datetime, window_hours: float, failed: bool
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT window_start_at FROM source_health WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        started = row["window_start_at"] if row else None
+        window = timedelta(hours=window_hours)
+        expired = not started or now - datetime.fromisoformat(str(started)) >= window
+        if expired:
+            self.connection.execute(
+                """
+                UPDATE source_health
+                SET window_start_at=?, window_attempts=1, window_failures=?
+                WHERE source_id=?
+                """,
+                (_iso(now), 1 if failed else 0, source_id),
+            )
+            return
+        self.connection.execute(
+            """
+            UPDATE source_health
+            SET window_attempts=window_attempts+1,
+                window_failures=window_failures + ?
+            WHERE source_id=?
+            """,
+            (1 if failed else 0, source_id),
+        )
+
+    def source_success(
+        self, source_id: str, now: datetime, window_hours: float = 6.0
+    ) -> None:
         self.connection.execute(
             """
             INSERT INTO source_health(source_id, consecutive_failures, last_success_at)
@@ -526,9 +676,12 @@ class RadarStore:
             """,
             (source_id, _iso(now)),
         )
+        self._bump_window(source_id, now, window_hours, failed=False)
         self.connection.commit()
 
-    def source_failure(self, source_id: str, error: str, now: datetime) -> int:
+    def source_failure(
+        self, source_id: str, error: str, now: datetime, window_hours: float = 6.0
+    ) -> int:
         self.connection.execute(
             """
             INSERT INTO source_health(
@@ -541,12 +694,26 @@ class RadarStore:
             """,
             (source_id, _iso(now), error[:500]),
         )
+        self._bump_window(source_id, now, window_hours, failed=True)
         self.connection.commit()
         row = self.connection.execute(
             "SELECT consecutive_failures FROM source_health WHERE source_id=?",
             (source_id,),
         ).fetchone()
         return int(row["consecutive_failures"])
+
+    def source_window(self, source_id: str) -> tuple[int, int]:
+        """Attempts and failures inside the current health window."""
+        row = self.connection.execute(
+            """
+            SELECT window_attempts, window_failures FROM source_health
+            WHERE source_id=?
+            """,
+            (source_id,),
+        ).fetchone()
+        if not row:
+            return 0, 0
+        return int(row["window_attempts"] or 0), int(row["window_failures"] or 0)
 
     def source_alert_due(
         self, source_id: str, now: datetime, cooldown_hours: float
@@ -567,44 +734,81 @@ class RadarStore:
         )
         self.connection.commit()
 
-    def prune(self, now: datetime, retention_days: int) -> None:
+    def prune(
+        self,
+        now: datetime,
+        retention_days: int,
+        *,
+        item_retention_days: int = 0,
+        delivery_retention_days: int = 0,
+    ) -> None:
         cutoff = _iso(now - timedelta(days=retention_days))
+        # Discovery pulls two orders of magnitude more headlines than official
+        # feeds, so seen_items gets its own shorter horizon.
+        item_cutoff = _iso(
+            now - timedelta(days=item_retention_days or retention_days)
+        )
+        delivery_cutoff = _iso(
+            now - timedelta(days=delivery_retention_days or retention_days)
+        )
         with self.transaction() as connection:
-            connection.execute("DELETE FROM seen_items WHERE seen_at < ?", (cutoff,))
             connection.execute(
-                "DELETE FROM observations WHERE observed_at < ?", (cutoff,)
+                "DELETE FROM seen_items WHERE seen_at < ?", (item_cutoff,)
+            )
+            connection.execute(
+                "DELETE FROM observations WHERE observed_at < ?", (item_cutoff,)
             )
             connection.execute(
                 "DELETE FROM seen_topics WHERE last_seen_at < ?", (cutoff,)
             )
+            connection.execute(
+                "DELETE FROM topic_lineage WHERE last_sent_at < ?", (cutoff,)
+            )
+            connection.execute(
+                "DELETE FROM deliveries WHERE sent_at < ?", (delivery_cutoff,)
+            )
+            connection.execute(
+                """
+                DELETE FROM source_health
+                WHERE coalesce(last_success_at, last_failure_at, '') < ?
+                """,
+                (delivery_cutoff,),
+            )
 
     def export_deliveries(self, path: Path) -> int:
+        # json_each expands one row per event_key and joins on an exact match.
+        # The old instr() join matched any key that was a substring of the JSON
+        # blob, multiplying rows and pairing keys with the wrong summary.
         rows = self.connection.execute(
-            """
-            SELECT d.sent_at, d.event_keys_json, d.content_hash, t.last_summary
+            f"""
+            SELECT d.sent_at, k.value AS event_key, d.content_hash, t.last_summary
             FROM deliveries d
-            LEFT JOIN seen_topics t
-              ON instr(d.event_keys_json, t.event_key) > 0
-            ORDER BY d.sent_at ASC
+            JOIN json_each(d.event_keys_json) k
+            LEFT JOIN seen_topics t ON t.event_key = k.value
+            WHERE k.value NOT LIKE '{INFRA_EVENT_PREFIX}%'
+            ORDER BY d.sent_at ASC, k.value ASC
             """
         ).fetchall()
-        lines: list[str] = []
-        for row in rows:
-            event_keys = json.loads(str(row["event_keys_json"]))
-            for event_key in event_keys:
-                sent_at = datetime.fromisoformat(str(row["sent_at"]))
-                lines.append(
-                    json_dumps(
-                        {
-                            "date": sent_at.astimezone().date().isoformat(),
-                            "event_key": event_key,
-                            "content_hash": str(row["content_hash"])[:8],
-                            "mention_count": 1,
-                            "last_summary": str(row["last_summary"] or "")[:50],
-                            "source": "radar",
-                        }
-                    )
-                )
+        lines = [
+            json_dumps(
+                {
+                    "date": datetime.fromisoformat(str(row["sent_at"]))
+                    .astimezone()
+                    .date()
+                    .isoformat(),
+                    "event_key": str(row["event_key"]),
+                    "content_hash": str(row["content_hash"])[:8],
+                    "mention_count": 1,
+                    "last_summary": str(row["last_summary"] or "")[:50],
+                    "source": "radar",
+                }
+            )
+            for row in rows
+        ]
+        content = "\n".join(lines) + ("\n" if lines else "")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        # Rewriting an identical ledger on every send burns disk for nothing.
+        if path.exists() and path.read_text(encoding="utf-8") == content:
+            return len(lines)
+        path.write_text(content, encoding="utf-8")
         return len(lines)
