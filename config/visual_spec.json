@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "primary_question": "刚刚发生了什么，为什么现在重要？",
+  "headline": "央行意外调整利率",
+  "answer": "官方公布新的利率决定，风险资产定价可能立即调整。",
+  "semantic_roles": ["status", "category", "time", "source"],
+  "intents": ["state"],
+  "evidence": [
+    {
+      "label": "事件标题",
+      "value": "央行意外调整利率",
+      "role": "status",
+      "source_path": "$.summary.title"
+    },
+    {
+      "label": "核心事实",
+      "value": "官方公布新的利率决定。",
+      "role": "status",
+      "source_path": "$.summary.fact"
+    },
+    {
+      "label": "即时影响",
+      "value": "风险资产定价可能立即调整。",
+      "role": "status",
+      "source_path": "$.summary.impact"
+    },
+    {
+      "label": "发生时间",
+      "value": "2026-07-25T17:55:00+08:00",
+      "role": "time",
+      "source_path": "$.items[0].published_at"
+    },
+    {
+      "label": "扫描时间",
+      "value": "2026-07-25T18:00:00+08:00",
+      "role": "time",
+      "source_path": "$.rendered_at"
+    },
+    {
+      "label": "来源",
+      "value": "Federal Reserve",
+      "role": "source",
+      "source_path": "$.items[0].source"
+    }
+  ],
+  "scores": {"text": 98, "image": 18, "video": 0},
+  "selected_modality": "text",
+  "delivery_format": "html",
+  "fallback_chain": ["text"],
+  "selection_reason": "一条结论和最多五条事实无需共享坐标或空间关系，Telegram 原生文字最快且可搜索。",
+  "grammar": "verdict-key-values",
+  "feature_gate": {
+    "rich_messages": false,
+    "images": false,
+    "videos": false,
+    "max_rich_text_chars": 32768,
+    "max_html_chars": 400
+  },
+  "warnings": [
+    "Rich Messages 未启用；使用 Telegram HTML，并保留 plain text fallback。"
+  ]
+}

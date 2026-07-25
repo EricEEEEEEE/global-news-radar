@@ -1,0 +1,18 @@
+[program:global_news_radar]
+command=/opt/global-news-radar/.venv/bin/python -u /opt/global-news-radar/main.py --root /opt/global-news-radar run --send
+directory=/opt/global-news-radar
+user=radar
+autostart=true
+autorestart=true
+startsecs=10
+startretries=3
+stopwaitsecs=15
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/opt/global-news-radar/logs/supervisor.out.log
+stderr_logfile=/opt/global-news-radar/logs/supervisor.err.log
+stdout_logfile_maxbytes=20MB
+stderr_logfile_maxbytes=20MB
+stdout_logfile_backups=5
+stderr_logfile_backups=5
+environment=PYTHONUNBUFFERED="1"

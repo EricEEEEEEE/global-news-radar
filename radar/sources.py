@@ -1,0 +1,344 @@
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import Any
+from urllib.parse import quote_plus
+
+import requests
+from defusedxml import ElementTree as SafeET
+
+from .models import NewsItem
+from .store import RadarStore
+from .util import parse_datetime, stable_hash
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _child_text(node: Any, *names: str) -> str:
+    for name in names:
+        child = node.find(name)
+        if child is not None and child.text:
+            return child.text.strip()
+        for candidate in list(node):
+            if (
+                candidate.tag.rsplit("}", 1)[-1].lower() == name.lower()
+                and candidate.text
+            ):
+                return candidate.text.strip()
+    return ""
+
+
+def _link(node: Any) -> str:
+    direct = _child_text(node, "link")
+    if direct:
+        return direct
+    for candidate in list(node):
+        if candidate.tag.rsplit("}", 1)[-1].lower() == "link":
+            return str(candidate.attrib.get("href", ""))
+    return ""
+
+
+class HttpClient:
+    def __init__(self, user_agent: str, timeout: int = 18):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept": (
+                    "application/rss+xml, application/atom+xml, "
+                    "application/json, text/xml;q=0.9"
+                ),
+            }
+        )
+        self.timeout = timeout
+
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        response = self.session.get(url, timeout=self.timeout, **kwargs)
+        response.raise_for_status()
+        return response
+
+
+class RssCollector:
+    def __init__(self, client: HttpClient, store: RadarStore):
+        self.client = client
+        self.store = store
+
+    def collect(
+        self,
+        *,
+        source_id: str,
+        source_name: str,
+        url: str,
+        source_tier: str,
+        region: str,
+        category_hint: str,
+        now: datetime,
+    ) -> list[NewsItem]:
+        headers: dict[str, str] = {}
+        etag = self.store.get_meta(f"etag:{source_id}")
+        modified = self.store.get_meta(f"modified:{source_id}")
+        if etag:
+            headers["If-None-Match"] = etag
+        if modified:
+            headers["If-Modified-Since"] = modified
+        response = self.client.session.get(
+            url, headers=headers, timeout=self.client.timeout
+        )
+        if response.status_code == 304:
+            return []
+        response.raise_for_status()
+        if response.headers.get("ETag"):
+            self.store.set_meta(f"etag:{source_id}", response.headers["ETag"], now)
+        if response.headers.get("Last-Modified"):
+            self.store.set_meta(
+                f"modified:{source_id}", response.headers["Last-Modified"], now
+            )
+        root = SafeET.fromstring(response.content)
+        entries = [
+            node
+            for node in root.iter()
+            if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}
+        ]
+        result: list[NewsItem] = []
+        for entry in entries:
+            title = _child_text(entry, "title")
+            link = _link(entry)
+            published = parse_datetime(
+                _child_text(entry, "pubDate", "published", "updated", "date")
+            )
+            if not title or not link or published is None:
+                continue
+            item_source = _child_text(entry, "source") or source_name
+            summary = _child_text(entry, "description", "summary", "content")
+            identity = stable_hash(
+                f"{source_id}|{_child_text(entry, 'guid', 'id') or link}|{title}", 24
+            )
+            result.append(
+                NewsItem(
+                    identity=identity,
+                    title=title,
+                    url=link,
+                    source=item_source,
+                    source_id=source_id,
+                    source_tier=source_tier,
+                    published_at=published,
+                    fetched_at=now,
+                    summary=summary,
+                    region=region,
+                    category_hint=category_hint,
+                )
+            )
+        return result
+
+
+def discovery_queries(now_sgt: datetime) -> list[tuple[str, str]]:
+    queries = [
+        ("breaking_finance", "breaking financial news when:1h"),
+        ("crypto", "crypto Bitcoin regulation breaking news when:1h"),
+    ]
+    hour = now_sgt.hour
+    if 0 <= hour < 8:
+        queries.append(("asia", "China Japan Korea market breaking news when:1h"))
+    elif 8 <= hour < 16:
+        queries.append(
+            ("europe", "ECB Europe energy geopolitical breaking news when:1h")
+        )
+    else:
+        queries.append(("us", "Fed Treasury earnings US market breaking news when:1h"))
+    return queries
+
+
+class GoogleNewsCollector:
+    def __init__(self, rss: RssCollector):
+        self.rss = rss
+
+    def collect(self, now: datetime, now_sgt: datetime) -> list[NewsItem]:
+        result: list[NewsItem] = []
+        for query_id, query in discovery_queries(now_sgt):
+            url = (
+                "https://news.google.com/rss/search?q="
+                f"{quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+            )
+            items = self.rss.collect(
+                source_id=f"gnews:{query_id}",
+                source_name="Google News",
+                url=url,
+                source_tier="secondary",
+                region=query_id if query_id in {"asia", "europe", "us"} else "global",
+                category_hint="discovery",
+                now=now,
+            )
+            result.extend(items)
+        return result
+
+
+class GdeltCollector:
+    ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    def __init__(self, client: HttpClient):
+        self.client = client
+
+    def collect(self, now: datetime, now_sgt: datetime) -> list[NewsItem]:
+        query = discovery_queries(now_sgt)[-1][1].replace(" when:1h", "")
+        response = self.client.get(
+            self.ENDPOINT,
+            params={
+                "query": query,
+                "mode": "artlist",
+                "format": "json",
+                "maxrecords": 50,
+                "timespan": "60min",
+                "sort": "HybridRel",
+            },
+        )
+        payload = response.json()
+        result: list[NewsItem] = []
+        for row in payload.get("articles", []):
+            title = str(row.get("title") or "").strip()
+            url = str(row.get("url") or "").strip()
+            published = parse_datetime(str(row.get("seendate") or ""))
+            if not title or not url or published is None:
+                continue
+            source = str(row.get("domain") or "GDELT")
+            result.append(
+                NewsItem(
+                    identity=stable_hash(f"gdelt|{url}|{title}", 24),
+                    title=title,
+                    url=url,
+                    source=source,
+                    source_id="gdelt",
+                    source_tier="fallback",
+                    published_at=published,
+                    fetched_at=now,
+                    region="global",
+                    category_hint="discovery",
+                    raw={
+                        "language": row.get("language"),
+                        "sourcecountry": row.get("sourcecountry"),
+                    },
+                )
+            )
+        return result
+
+
+def _float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", ""))
+    except ValueError:
+        return None
+
+
+def _has_clock(value: Any) -> bool:
+    text = str(value or "").strip()
+    return "T" in text or bool(re.search(r"\s\d{1,2}:\d{2}(?::\d{2})?", text))
+
+
+class FmpCollector:
+    BASE = "https://financialmodelingprep.com/stable"
+
+    def __init__(self, client: HttpClient, api_key: str, config: dict[str, Any]):
+        self.client = client
+        self.api_key = api_key
+        self.config = config
+
+    def _get(self, endpoint: str, now: datetime) -> list[dict[str, Any]]:
+        start = (now - timedelta(days=1)).date().isoformat()
+        end = now.date().isoformat()
+        response = self.client.get(
+            f"{self.BASE}/{endpoint}",
+            params={"from": start, "to": end, "apikey": self.api_key},
+        )
+        payload = response.json()
+        if not isinstance(payload, list):
+            detail = (
+                sorted(payload)[:8]
+                if isinstance(payload, dict)
+                else type(payload).__name__
+            )
+            raise RuntimeError(f"FMP returned unexpected payload: {detail}")
+        return payload
+
+    def collect_macro(self, now: datetime) -> list[NewsItem]:
+        if not self.api_key:
+            return []
+        watch = [item.lower() for item in self.config["macro_events"]]
+        result: list[NewsItem] = []
+        for row in self._get("economic-calendar", now):
+            name = str(row.get("event") or row.get("name") or "").strip()
+            if not name or not any(term in name.lower() for term in watch):
+                continue
+            actual = _float(row.get("actual"))
+            estimate = _float(row.get("estimate") or row.get("consensus"))
+            raw_date = row.get("date")
+            if not _has_clock(raw_date):
+                continue
+            published = parse_datetime(str(raw_date or ""))
+            if actual is None or estimate is None or published is None:
+                continue
+            country = str(row.get("country") or "").strip()
+            unit = str(row.get("unit") or row.get("impact") or "")
+            raw_identity = f"macro|{name}|{published.isoformat()}|{actual}|{estimate}"
+            result.append(
+                NewsItem(
+                    identity=stable_hash(raw_identity, 24),
+                    title=f"{country} {name}: actual {actual:g}, estimate {estimate:g}",
+                    url="https://site.financialmodelingprep.com/developer/docs/stable/economics-calendar",
+                    source="FMP Economic Calendar",
+                    source_id="fmp_macro",
+                    source_tier="structured",
+                    published_at=published,
+                    fetched_at=now,
+                    region="global",
+                    category_hint="macro",
+                    actual=actual,
+                    estimate=estimate,
+                    unit=unit,
+                    raw=row,
+                )
+            )
+        return result
+
+    def collect_earnings(self, now: datetime) -> list[NewsItem]:
+        if not self.api_key:
+            return []
+        symbols = set(self.config["mega_cap_symbols"])
+        result: list[NewsItem] = []
+        for row in self._get("earnings-calendar", now):
+            symbol = str(row.get("symbol") or "").upper()
+            if symbol not in symbols:
+                continue
+            actual = _float(row.get("epsActual") or row.get("actual"))
+            estimate = _float(row.get("epsEstimated") or row.get("estimate"))
+            raw_date = row.get("date")
+            if not _has_clock(raw_date):
+                continue
+            published = parse_datetime(str(raw_date or ""))
+            if actual is None or estimate in {None, 0} or published is None:
+                continue
+            raw_identity = (
+                f"earnings|{symbol}|{published.isoformat()}|{actual}|{estimate}"
+            )
+            result.append(
+                NewsItem(
+                    identity=stable_hash(raw_identity, 24),
+                    title=f"{symbol} EPS actual {actual:g}, estimate {estimate:g}",
+                    url="https://site.financialmodelingprep.com/developer/docs/stable/earnings-calendar",
+                    source="FMP Earnings Calendar",
+                    source_id="fmp_earnings",
+                    source_tier="structured",
+                    published_at=published,
+                    fetched_at=now,
+                    region="us",
+                    category_hint="earnings",
+                    actual=actual,
+                    estimate=estimate,
+                    unit="EPS",
+                    symbol=symbol,
+                    raw=row,
+                )
+            )
+        return result

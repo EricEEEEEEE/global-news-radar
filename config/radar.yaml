@@ -1,0 +1,103 @@
+version: "1.1.0"
+timezone: Asia/Singapore
+poll_seconds: 120
+heartbeat_seconds: 300
+freshness_minutes: 75
+future_tolerance_minutes: 5
+topic_cooldown_hours: 6
+topic_retention_days: 30
+corroboration_minutes: 20
+p1_window_minutes: 120
+p1_expiry_minutes: 180
+quiet_window:
+  start: "21:00"
+  end: "21:30"
+telegram:
+  chat_id: "0"
+  news_thread_id: "0"
+  monitor_thread_id: "0"
+  max_visible_chars: 400
+runtime:
+  send_enabled: false
+  baseline_on_first_run: true
+  source_failure_alert_after: 3
+  source_error_cooldown_hours: 12
+  delivery_retry_minutes: 10
+  delivery_max_attempts: 6
+llm:
+  enabled: false
+  model: ""
+  timeout_seconds: 35
+  max_output_tokens: 400
+official_feeds:
+  - id: fed_all
+    name: Federal Reserve
+    url: https://www.federalreserve.gov/feeds/press_all.xml
+    region: us
+    category_hint: central_bank
+  - id: fed_monetary
+    name: Federal Reserve
+    url: https://www.federalreserve.gov/feeds/press_monetary.xml
+    region: us
+    category_hint: central_bank
+  - id: ecb_press
+    name: European Central Bank
+    url: https://www.ecb.europa.eu/rss/press.html
+    region: eu
+    category_hint: central_bank
+  - id: sec_press
+    name: U.S. SEC
+    url: https://www.sec.gov/news/pressreleases.rss
+    region: us
+    category_hint: regulation
+  - id: cftc_general
+    name: U.S. CFTC
+    url: https://www.cftc.gov/RSS/RSSGP/rssgp.xml
+    region: us
+    category_hint: regulation
+  - id: cftc_enforcement
+    name: U.S. CFTC
+    url: https://www.cftc.gov/RSS/RSSENF/rssenf.xml
+    region: us
+    category_hint: regulation
+  - id: boj_news
+    name: Bank of Japan
+    url: https://www.boj.or.jp/rss/whatsnew.xml
+    region: asia
+    category_hint: central_bank
+discovery:
+  enabled: true
+  interval_cycles: 5
+  max_queries: 3
+  gdelt_fallback: true
+  major_sources:
+    - Reuters
+    - Associated Press
+    - Bloomberg
+    - Financial Times
+    - CNBC
+    - Wall Street Journal
+    - Nikkei Asia
+    - BBC
+    - Al Jazeera
+structured:
+  fmp_enabled: false
+  interval_cycles: 5
+  macro_events:
+    - consumer price index
+    - cpi
+    - nonfarm payroll
+    - non-farm payroll
+    - gross domestic product
+    - gdp
+  mega_cap_symbols:
+    - AAPL
+    - MSFT
+    - AMZN
+    - GOOGL
+    - META
+    - NVDA
+    - TSLA
+  rate_surprise_pp: 0.3
+  count_relative_surprise: 0.3
+  earnings_surprise_ratio: 0.1
