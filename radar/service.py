@@ -41,6 +41,27 @@ from .util import (
 
 LOGGER = logging.getLogger(__name__)
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def _env_flag(env: dict[str, str], name: str, default: bool) -> bool:
+    """Read an optional-collector toggle from the environment.
+
+    Tracked config ships every optional collector off, so a fresh clone is
+    inert and cannot burn someone's API quota by accident. A deployment turns
+    one on in .env next to the credential it needs, instead of editing a
+    tracked file it would then have to keep out of every commit.
+    """
+    raw = env.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
 
 class RadarService:
     def __init__(
@@ -60,23 +81,23 @@ class RadarService:
                 "FMP_API_KEY",
                 "TELEGRAM_BOT_TOKEN",
                 "LLM_API_KEY",
+                "FE_LLM_API_KEY",
             )
         )
-        self.news_thread_id = env.get(
-            "TELEGRAM_NEWS_THREAD_ID",
-            str(config["telegram"]["news_thread_id"]),
+        # A key left blank in .env means "I did not set this", not "send an
+        # empty string": .env.example ships blank lines to be filled in, and
+        # dict.get only falls back when the key is absent entirely.
+        self.news_thread_id = env.get("TELEGRAM_NEWS_THREAD_ID") or str(
+            config["telegram"]["news_thread_id"]
         )
-        self.monitor_thread_id = env.get(
-            "TELEGRAM_MONITOR_THREAD_ID",
-            str(config["telegram"]["monitor_thread_id"]),
+        self.monitor_thread_id = env.get("TELEGRAM_MONITOR_THREAD_ID") or str(
+            config["telegram"]["monitor_thread_id"]
         )
         self.store = RadarStore(root / "state" / "radar.sqlite3")
         self.client = HttpClient(
-            user_agent=env.get(
-                "RADAR_USER_AGENT",
-                f"global-news-radar/{__version__} "
-                "(+https://github.com/EricEEEEEEE/global-news-radar)",
-            ),
+            user_agent=env.get("RADAR_USER_AGENT")
+            or f"global-news-radar/{__version__} "
+            "(+https://github.com/EricEEEEEEE/global-news-radar)",
             attempts=int(config["runtime"]["source_retry_attempts"]),
         )
         self.rss = RssCollector(self.client, self.store)
@@ -89,17 +110,25 @@ class RadarService:
             env.get("FMP_API_KEY", ""),
             config["structured"],
         )
+        self.fmp_enabled = _env_flag(
+            env, "RADAR_FMP_ENABLED", bool(config["structured"]["fmp_enabled"])
+        )
         self.summarizer = LlmSummarizer(
-            enabled=bool(config["llm"]["enabled"]),
-            base_url=env.get("LLM_API_BASE", ""),
-            api_key=env.get("LLM_API_KEY", ""),
-            model=env.get("LLM_MODEL", config["llm"]["model"]),
+            enabled=_env_flag(env, "RADAR_LLM_ENABLED", bool(config["llm"]["enabled"])),
+            # FE_LLM_* are the names this radar shipped with. They are still
+            # honoured so an existing deployment keeps summarising after an
+            # upgrade instead of silently falling back to raw headlines.
+            base_url=env.get("LLM_API_BASE") or env.get("FE_LLM_API_BASE", ""),
+            api_key=env.get("LLM_API_KEY") or env.get("FE_LLM_API_KEY", ""),
+            model=env.get("LLM_MODEL")
+            or env.get("FE_LLM_MODEL")
+            or config["llm"]["model"],
             timeout=int(config["llm"]["timeout_seconds"]),
             max_output_tokens=int(config["llm"]["max_output_tokens"]),
         )
         self.delivery = TelegramDelivery(
             token=env.get("TELEGRAM_BOT_TOKEN", ""),
-            chat_id=env.get("TELEGRAM_CHAT_ID", str(config["telegram"]["chat_id"])),
+            chat_id=env.get("TELEGRAM_CHAT_ID") or str(config["telegram"]["chat_id"]),
             outbox_dir=root / "outbox",
             max_visible_chars=int(config["telegram"]["max_visible_chars"]),
             send_enabled=send_enabled,
@@ -262,7 +291,7 @@ class RadarService:
             first_collection
             or self._cycle % int(self.config["structured"]["interval_cycles"]) == 0
         )
-        if bool(self.config["structured"]["fmp_enabled"]) and structured_due:
+        if self.fmp_enabled and structured_due:
             # FMP is the only source of scheduled macro and earnings releases:
             # losing it is closer to losing an official feed than to losing one
             # of eleven discovery feeds, so it alerts on the strict threshold.

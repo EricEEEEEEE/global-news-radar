@@ -79,6 +79,7 @@ def main() -> int:
             "FMP_API_KEY",
             "TELEGRAM_BOT_TOKEN",
             "LLM_API_KEY",
+            "FE_LLM_API_KEY",
         )
     )
     configure_logging(root, args.verbose)

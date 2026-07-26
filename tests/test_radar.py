@@ -1387,6 +1387,85 @@ class ServiceIntegrationTests(unittest.TestCase):
             self.assertEqual(service.monitor_thread_id, "88")
             service.close()
 
+    def _service(self, root: Path, env: dict[str, str]) -> RadarService:
+        for name in ("state", "logs", "outbox"):
+            root.joinpath(name).mkdir(parents=True, exist_ok=True)
+        return RadarService(
+            root=root,
+            config=copy.deepcopy(CONFIG),
+            env=env,
+            send_enabled=False,
+        )
+
+    def test_blank_env_value_falls_back_to_config(self) -> None:
+        # .env.example ships blank lines to fill in, and load_env stores those
+        # as "". A blank line must mean "unset", not "send an empty route".
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory),
+                {
+                    "TELEGRAM_NEWS_THREAD_ID": "",
+                    "TELEGRAM_MONITOR_THREAD_ID": "",
+                    "RADAR_USER_AGENT": "",
+                },
+            )
+            self.assertEqual(
+                service.news_thread_id, str(CONFIG["telegram"]["news_thread_id"])
+            )
+            self.assertEqual(
+                service.monitor_thread_id, str(CONFIG["telegram"]["monitor_thread_id"])
+            )
+            self.assertIn(
+                f"global-news-radar/{__version__}",
+                service.client.session.headers["User-Agent"],
+            )
+            service.close()
+
+    def test_environment_enables_optional_collectors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertFalse(CONFIG["llm"]["enabled"])
+            self.assertFalse(CONFIG["structured"]["fmp_enabled"])
+            service = self._service(
+                root,
+                {
+                    "RADAR_LLM_ENABLED": "true",
+                    "RADAR_FMP_ENABLED": "1",
+                    "LLM_API_BASE": "http://127.0.0.1:8317/v1",
+                    "LLM_API_KEY": "key",
+                    "LLM_MODEL": "model",
+                },
+            )
+            self.assertTrue(service.summarizer.enabled)
+            self.assertTrue(service.fmp_enabled)
+            service.close()
+
+            off = self._service(root, {"RADAR_LLM_ENABLED": "off"})
+            self.assertFalse(off.summarizer.enabled)
+            self.assertFalse(off.fmp_enabled)
+            off.close()
+
+    def test_unparseable_toggle_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                self._service(Path(directory), {"RADAR_FMP_ENABLED": "maybe"})
+
+    def test_legacy_llm_environment_names_still_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory),
+                {
+                    "RADAR_LLM_ENABLED": "yes",
+                    "FE_LLM_API_BASE": "http://127.0.0.1:8317/v1",
+                    "FE_LLM_API_KEY": "legacy-key",
+                    "FE_LLM_MODEL": "legacy-model",
+                },
+            )
+            self.assertEqual(service.summarizer.base_url, "http://127.0.0.1:8317/v1")
+            self.assertEqual(service.summarizer.model, "legacy-model")
+            self.assertEqual(redact_secrets("legacy-key leaked"), "*** leaked")
+            service.close()
+
 
 if __name__ == "__main__":
     unittest.main()

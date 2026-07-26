@@ -10,6 +10,8 @@ to wait for a daily market brief.
 It is deliberately **not** a price dashboard, technical-analysis feed, portfolio
 manager, or trading bot.
 
+中文说明：[README.zh.md](README.zh.md)
+
 ## What it does
 
 - Polls central-bank and regulator RSS feeds every two minutes.
@@ -57,16 +59,20 @@ TELEGRAM_CHAT_ID=
 TELEGRAM_NEWS_THREAD_ID=0
 TELEGRAM_MONITOR_THREAD_ID=0
 
-# Optional structured data
+# Optional structured macro/earnings data
+RADAR_FMP_ENABLED=false
 FMP_API_KEY=
 
 # Optional OpenAI-compatible translation/compression endpoint
+RADAR_LLM_ENABLED=false
 LLM_API_BASE=
 LLM_API_KEY=
 LLM_MODEL=
 ```
 
-Use topic ID `0` when the target chat does not use Telegram forum topics.
+Use topic ID `0` when the target chat does not use Telegram forum topics. A key
+left blank means "not set" and falls back to `config/radar.yaml`, so you can copy
+the template and fill in only the lines you need.
 
 Inspect one cycle without touching state — nothing is marked seen, no heartbeat
 is written, and the conditional-GET cache is left alone, so this is safe to run
@@ -120,10 +126,14 @@ and `21:00–21:30` quiet window. Edit `config/radar.yaml` to:
 - add or remove official RSS feeds;
 - choose discovery and structured-data intervals;
 - tune only the documented deterministic thresholds;
-- enable the optional LLM or FMP collectors;
 - change the visible Telegram character budget.
 
 Telegram credentials and routes belong in `.env`, never in tracked configuration.
+The optional LLM and FMP collectors ship off, so a fresh clone cannot spend
+someone's API quota by accident. Turn one on with `RADAR_LLM_ENABLED` or
+`RADAR_FMP_ENABLED` in `.env`, next to the credential it needs — an operational
+switch does not belong in a file every deployment would then have to keep out of
+its own commits.
 
 ## Source-health alerts
 
