@@ -835,9 +835,7 @@ class RadarStore:
         cutoff = _iso(now - timedelta(days=retention_days))
         # Discovery pulls two orders of magnitude more headlines than official
         # feeds, so seen_items gets its own shorter horizon.
-        item_cutoff = _iso(
-            now - timedelta(days=item_retention_days or retention_days)
-        )
+        item_cutoff = _iso(now - timedelta(days=item_retention_days or retention_days))
         delivery_cutoff = _iso(
             now - timedelta(days=delivery_retention_days or retention_days)
         )

@@ -1164,9 +1164,7 @@ class ServiceIntegrationTests(unittest.TestCase):
                         raise RuntimeError("502 Server Error: Bad Gateway")
                     return []
 
-                service._source_call(
-                    source_id, call, now, errors, recoveries, tier
-                )
+                service._source_call(source_id, call, now, errors, recoveries, tier)
                 return [], errors, recoveries
 
             service.collect = collect
@@ -1178,9 +1176,7 @@ class ServiceIntegrationTests(unittest.TestCase):
             service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
             # Discovery runs every ten minutes, so the old shared threshold of 3
             # interrupted after half an hour of one commercial CDN misbehaving.
-            self._drive_source(
-                service, "investing_news", [True] * 3, "secondary", NOW
-            )
+            self._drive_source(service, "investing_news", [True] * 3, "secondary", NOW)
             self.assertEqual(service.delivery.messages, [])
             self._drive_source(
                 service,
@@ -1226,9 +1222,7 @@ class ServiceIntegrationTests(unittest.TestCase):
             service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
             # Two failures never reach the primary threshold, so nobody was told
             # the source was down and nobody needs to be told it came back.
-            self._drive_source(
-                service, "fed_all", [True, True, False], "primary", NOW
-            )
+            self._drive_source(service, "fed_all", [True, True, False], "primary", NOW)
             self.assertEqual(service.delivery.messages, [])
             service.close()
 

@@ -730,9 +730,7 @@ class RadarService:
                     now,
                     int(self.config["telegram"]["max_visible_chars"]),
                 )
-                if self._deliver_or_queue(
-                    message, self.news_thread_id, now
-                ):
+                if self._deliver_or_queue(message, self.news_thread_id, now):
                     sent += 1
 
         self._source_recovery_alerts(recoveries, now)
@@ -847,9 +845,7 @@ class RadarService:
                 error="quiet_window",
             )
             return 0
-        if self._deliver_or_queue(
-            message, self.news_thread_id, now
-        ):
+        if self._deliver_or_queue(message, self.news_thread_id, now):
             return 1
         return 0
 
