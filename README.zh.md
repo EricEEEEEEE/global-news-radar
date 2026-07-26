@@ -85,8 +85,12 @@ RADAR_LLM_ENABLED=true
 警报跟着一起没了：
 
 ```cron
-*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >> logs/watchdog.log 2>&1
+*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >/dev/null 2>>logs/cron-watchdog.err
 ```
+
+它写自己的 `logs/watchdog.log`（同样 8MB×5 自轮转），不和守护进程抢 `radar.log`——
+两个进程轮转同一个文件会丢行。所以 cron 把重复的 stdout 丢掉，只留 stderr 兜住
+「日志系统起来之前就崩了」这种情况，正常时该文件为空。
 
 告警只在**状态跳变**时发，不是每轮都发：第一次失败发一条到 monitor topic，
 `watchdog_alert_cooldown_hours`（默认 6h）盖住中断的其余时间，恢复后补一条

@@ -53,12 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def configure_logging(root: Path, verbose: bool) -> None:
+def configure_logging(root: Path, verbose: bool, filename: str = "radar.log") -> None:
     root.joinpath("logs").mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
         RotatingFileHandler(
-            root / "logs" / "radar.log",
+            root / "logs" / filename,
             maxBytes=8 * 1024 * 1024,
             backupCount=5,
             encoding="utf-8",
@@ -93,7 +93,12 @@ def main() -> int:
             "FE_LLM_API_KEY",
         )
     )
-    configure_logging(root, args.verbose)
+    # The watchdog runs from cron every few minutes while the daemon holds
+    # radar.log open with its own rotating handler. Two processes rotating one
+    # file lose lines, and the component whose entire job is reliability is the
+    # worst place to accept that, so it gets its own self-rotating log.
+    log_name = "watchdog.log" if args.command == "watchdog" else "radar.log"
+    configure_logging(root, args.verbose, log_name)
 
     if args.command == "health":
         ok, payload = check_health(root, args.max_age_seconds)

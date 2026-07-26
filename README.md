@@ -127,8 +127,12 @@ Run it from cron rather than from the Supervisor that owns the daemon, so
 Supervisor going down does not take the alarm with it:
 
 ```cron
-*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >> logs/watchdog.log 2>&1
+*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >/dev/null 2>>logs/cron-watchdog.err
 ```
+
+It writes its own self-rotating `logs/watchdog.log` rather than sharing the
+daemon's, so cron discards the duplicate stdout; the error file stays empty
+unless the command fails before logging is up.
 
 It alerts on the transition, not on every run: the first failure sends one
 message to the monitor topic, `watchdog_alert_cooldown_hours` covers the rest of
