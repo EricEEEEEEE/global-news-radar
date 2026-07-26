@@ -559,6 +559,16 @@ class StoreGuardTests(unittest.TestCase):
                 visible_chars=10,
                 now=NOW,
             )
+            # Recovery notices ride the same delivery path and must stay out of
+            # the market-event ledger too.
+            store.record_delivery(
+                message=self._message(
+                    "source-recovery:ecb_press", content_hash="hash-2"
+                ),
+                message_id="2",
+                visible_chars=10,
+                now=NOW,
+            )
             output = Path(directory) / "state" / "radar_events.jsonl"
             self.assertEqual(store.export_deliveries(output), 0)
             self.assertEqual(output.read_text(encoding="utf-8"), "")
@@ -837,6 +847,7 @@ class ServiceIntegrationTests(unittest.TestCase):
                     )
                 ],
                 [],
+                [],
             )
             stats = service.run_once(NOW)
             self.assertEqual(stats["status"], "baseline")
@@ -861,9 +872,9 @@ class ServiceIntegrationTests(unittest.TestCase):
                 source="Bloomberg",
                 source_tier="secondary",
             )
-            service.collect = lambda now: ([first], [])
+            service.collect = lambda now: ([first], [], [])
             self.assertEqual(service.run_once(NOW)["sent"], 0)
-            service.collect = lambda now: ([second], [])
+            service.collect = lambda now: ([second], [], [])
             stats = service.run_once(NOW + timedelta(minutes=2))
             self.assertEqual(stats["sent"], 1)
             self.assertEqual(len(service.delivery.messages), 1)
@@ -886,9 +897,9 @@ class ServiceIntegrationTests(unittest.TestCase):
                 source_tier="secondary",
                 region="eu",
             )
-            service.collect = lambda now: ([merger], [])
+            service.collect = lambda now: ([merger], [], [])
             self.assertEqual(service.run_once(NOW)["sent"], 0)
-            service.collect = lambda now: ([financing], [])
+            service.collect = lambda now: ([financing], [], [])
             stats = service.run_once(NOW + timedelta(minutes=2))
             self.assertEqual(stats["sent"], 1)
             message = service.delivery.messages[0][0]
@@ -908,12 +919,12 @@ class ServiceIntegrationTests(unittest.TestCase):
             )
             fed.published_at = quiet_now - timedelta(minutes=2)
             fed.fetched_at = quiet_now
-            service.collect = lambda now: ([fed], [])
+            service.collect = lambda now: ([fed], [], [])
             stats = service.run_once(quiet_now)
             self.assertTrue(stats["quiet_window"])
             self.assertEqual(stats["sent"], 0)
             self.assertEqual(len(service.delivery.messages), 0)
-            service.collect = lambda now: ([], [])
+            service.collect = lambda now: ([], [], [])
             after = datetime(2026, 7, 25, 13, 31, tzinfo=UTC)
             stats = service.run_once(after)
             self.assertEqual(stats["retries"], 1)
@@ -930,7 +941,7 @@ class ServiceIntegrationTests(unittest.TestCase):
                 identity="failed-fed",
                 category_hint="central_bank",
             )
-            service.collect = lambda now: ([fed], [])
+            service.collect = lambda now: ([fed], [], [])
             stats = service.run_once(NOW)
             self.assertEqual(stats["sent"], 0)
             topic_count = service.store.connection.execute(
@@ -954,8 +965,9 @@ class ServiceIntegrationTests(unittest.TestCase):
                     "<urlopen error [Errno 8] & connection reset>"
                 ),
                 "failures": 3,
+                "tier": "primary",
             }
-            service.collect = lambda now: ([], [broken])
+            service.collect = lambda now: ([], [broken], [])
             service.run_once(NOW)
             self.assertEqual(len(service.delivery.messages), 1)
             message, thread_id = service.delivery.messages[0]
@@ -977,7 +989,7 @@ class ServiceIntegrationTests(unittest.TestCase):
             )
             fed.published_at = quiet_now - timedelta(minutes=2)
             fed.fetched_at = quiet_now
-            service.collect = lambda now: ([fed], [])
+            service.collect = lambda now: ([fed], [], [])
             self.assertTrue(service.run_once(quiet_now)["quiet_window"])
             row = service.store.connection.execute(
                 "SELECT next_retry_at FROM pending_delivery"
@@ -1013,9 +1025,9 @@ class ServiceIntegrationTests(unittest.TestCase):
                 assess(first, service.config).event_key,
                 assess(second, service.config).event_key,
             )
-            service.collect = lambda now: ([first], [])
+            service.collect = lambda now: ([first], [], [])
             self.assertEqual(service.run_once(NOW)["sent"], 0)
-            service.collect = lambda now: ([second], [])
+            service.collect = lambda now: ([second], [], [])
             stats = service.run_once(NOW + timedelta(minutes=2))
             self.assertEqual(stats["sent"], 1)
             self.assertEqual(service.delivery.messages[0][1], NEWS_THREAD)
@@ -1083,8 +1095,8 @@ class ServiceIntegrationTests(unittest.TestCase):
             def collect(now):
                 errors: list[dict] = []
                 for _ in range(3):
-                    service._source_call("fmp_macro", boom, now, errors)
-                return [], errors
+                    service._source_call("fmp_macro", boom, now, errors, tier="primary")
+                return [], errors, []
 
             service.collect = collect
             stats = service.run_once(NOW)
@@ -1115,8 +1127,8 @@ class ServiceIntegrationTests(unittest.TestCase):
                             raise RuntimeError("gateway timeout")
                         return []
 
-                    service._source_call("ecb_press", call, now, errors)
-                return [], errors
+                    service._source_call("ecb_press", call, now, errors, tier="primary")
+                return [], errors, []
 
             service.collect = collect
             service.run_once(NOW)
@@ -1124,6 +1136,189 @@ class ServiceIntegrationTests(unittest.TestCase):
             message, thread_id = service.delivery.messages[0]
             self.assertEqual(thread_id, MONITOR_THREAD)
             self.assertIn("60%", message.plain_text)
+            service.close()
+
+    def _drive_source(
+        self,
+        service: RadarService,
+        source_id: str,
+        outcomes: list[bool],
+        tier: str,
+        start: datetime,
+        step_minutes: int = 10,
+    ) -> None:
+        """Run one cycle per outcome, the way a real poll loop would.
+
+        Health state only advances per cycle, so failures spread across cycles
+        are what the thresholds actually measure. Collapsing them into a single
+        cycle would test something the daemon never does.
+        """
+        for offset, fails in enumerate(outcomes):
+
+            def collect(now, fails=fails):
+                errors: list[dict] = []
+                recoveries: list[dict] = []
+
+                def call():
+                    if fails:
+                        raise RuntimeError("502 Server Error: Bad Gateway")
+                    return []
+
+                service._source_call(
+                    source_id, call, now, errors, recoveries, tier
+                )
+                return [], errors, recoveries
+
+            service.collect = collect
+            service.run_once(start + timedelta(minutes=step_minutes * offset))
+
+    def test_discovery_source_stays_quiet_until_its_own_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            # Discovery runs every ten minutes, so the old shared threshold of 3
+            # interrupted after half an hour of one commercial CDN misbehaving.
+            self._drive_source(
+                service, "investing_news", [True] * 3, "secondary", NOW
+            )
+            self.assertEqual(service.delivery.messages, [])
+            self._drive_source(
+                service,
+                "investing_news",
+                [True] * 3,
+                "secondary",
+                NOW + timedelta(minutes=30),
+            )
+            self.assertEqual(len(service.delivery.messages), 1)
+            self.assertIn("连续失败 6 次", service.delivery.messages[0][0].plain_text)
+            service.close()
+
+    def test_primary_source_still_alerts_at_three(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            self._drive_source(service, "fed_all", [True] * 3, "primary", NOW)
+            self.assertEqual(len(service.delivery.messages), 1)
+            message, thread_id = service.delivery.messages[0]
+            self.assertEqual(thread_id, MONITOR_THREAD)
+            self.assertIn("连续失败 3 次", message.plain_text)
+            service.close()
+
+    def test_recovery_closes_an_announced_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            # Fail at +0/+10/+20 (alert on the third), recover at +30.
+            self._drive_source(
+                service, "fed_all", [True, True, True, False], "primary", NOW
+            )
+            self.assertEqual(len(service.delivery.messages), 2)
+            recovery, thread_id = service.delivery.messages[1]
+            self.assertEqual(thread_id, MONITOR_THREAD)
+            self.assertIn("fed_all 已恢复", recovery.plain_text)
+            self.assertIn("中断 30 分钟", recovery.plain_text)
+            self.assertEqual(recovery.event_keys, ["source-recovery:fed_all"])
+            service.close()
+
+    def test_recovery_is_silent_when_the_outage_was_never_announced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            # Two failures never reach the primary threshold, so nobody was told
+            # the source was down and nobody needs to be told it came back.
+            self._drive_source(
+                service, "fed_all", [True, True, False], "primary", NOW
+            )
+            self.assertEqual(service.delivery.messages, [])
+            service.close()
+
+    def test_a_new_outage_after_recovery_alerts_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            self._drive_source(
+                service, "fed_all", [True, True, True, False], "primary", NOW
+            )
+            self.assertEqual(len(service.delivery.messages), 2)
+            # The twelve-hour cooldown exists to silence repeats inside one
+            # outage. Once the incident was announced as recovered, the next
+            # outage is a new incident and must not be swallowed for a day.
+            self._drive_source(
+                service,
+                "fed_all",
+                [True, True, True],
+                "primary",
+                NOW + timedelta(minutes=120),
+            )
+            self.assertEqual(len(service.delivery.messages), 3)
+            service.close()
+
+    def test_a_bouncing_source_cannot_realert_inside_the_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            self._drive_source(
+                service, "fed_all", [True, True, True, False], "primary", NOW
+            )
+            self.assertEqual(len(service.delivery.messages), 2)
+            # Recovery landed at +30; source_realert_minutes is 60, so an outage
+            # that completes at +50 is still inside the gap.
+            self._drive_source(
+                service,
+                "fed_all",
+                [True, True, True],
+                "primary",
+                NOW + timedelta(minutes=40),
+                step_minutes=5,
+            )
+            self.assertEqual(len(service.delivery.messages), 2)
+            service.close()
+
+    def test_flapping_discovery_source_respects_its_tier_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            # 3 failures in 5 calls is a 60% rate, over the flapping threshold.
+            # Without a tier-aware failure floor the rate trigger would page at
+            # 3 failures and quietly undo the discovery threshold of 6.
+            self._drive_source(
+                service,
+                "investing_news",
+                [True, False, True, False, True],
+                "secondary",
+                NOW,
+            )
+            self.assertEqual(service.delivery.messages, [])
+            service.close()
+
+    def test_upgrade_does_not_announce_a_pre_upgrade_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            # Exactly the state this deployment inherited: alerted yesterday,
+            # healthy again, and no recovered_at because the column is new.
+            service.store.connection.execute(
+                """
+                INSERT INTO source_health(
+                    source_id, consecutive_failures, last_success_at, last_alert_at
+                ) VALUES('investing_news', 0, ?, ?)
+                """,
+                (
+                    (NOW - timedelta(hours=1)).isoformat(),
+                    (NOW - timedelta(hours=12)).isoformat(),
+                ),
+            )
+            service.store.connection.execute(
+                "UPDATE source_health SET recovered_at=NULL WHERE source_id=?",
+                ("investing_news",),
+            )
+            service.store.connection.commit()
+            service.store._migrate()
+            # One failure, then a success: the old alert must not resurface.
+            self._drive_source(
+                service, "investing_news", [True, False], "secondary", NOW
+            )
+            self.assertEqual(service.delivery.messages, [])
             service.close()
 
     def test_readonly_cycle_consumes_no_state(self) -> None:
@@ -1135,7 +1330,7 @@ class ServiceIntegrationTests(unittest.TestCase):
                 identity="readonly-fed",
                 category_hint="central_bank",
             )
-            service.collect = lambda now: ([fed], [])
+            service.collect = lambda now: ([fed], [], [])
             stats = service.run_once(NOW, readonly=True)
             self.assertEqual(stats["status"], "readonly")
             self.assertEqual(stats["eligible"], 1)

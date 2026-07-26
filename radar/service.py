@@ -121,12 +121,16 @@ class RadarService:
         callback: Any,
         now: datetime,
         errors: list[dict[str, Any]],
+        recoveries: list[dict[str, Any]] | None = None,
+        tier: str = "secondary",
     ) -> list[NewsItem]:
         window_hours = float(self.config["runtime"]["source_health_window_hours"])
         try:
             items = callback()
             if not self.readonly:
-                self.store.source_success(source_id, now, window_hours)
+                recovery = self.store.source_success(source_id, now, window_hours)
+                if recovery and recoveries is not None:
+                    recoveries.append(recovery)
             return items
         except Exception as exc:  # noqa: BLE001
             # Upstream error text carries the full request URL, and the FMP URL
@@ -135,7 +139,12 @@ class RadarService:
             reason = redact_secrets(exc)
             if self.readonly:
                 errors.append(
-                    {"source_id": source_id, "error": reason[:300], "failures": 0}
+                    {
+                        "source_id": source_id,
+                        "error": reason[:300],
+                        "failures": 0,
+                        "tier": tier,
+                    }
                 )
                 LOGGER.error(
                     "source_failed source=%s error=%s", source_id, reason[:300]
@@ -150,6 +159,7 @@ class RadarService:
                     "failures": count,
                     "window_attempts": attempts,
                     "window_failures": failures,
+                    "tier": tier,
                 }
             )
             LOGGER.error(
@@ -166,6 +176,7 @@ class RadarService:
         source_tier: str,
         now: datetime,
         errors: list[dict[str, Any]],
+        recoveries: list[dict[str, Any]],
     ) -> list[NewsItem]:
         items: list[NewsItem] = []
         for feed in feeds:
@@ -183,17 +194,26 @@ class RadarService:
                     ),
                     now,
                     errors,
+                    recoveries,
+                    source_tier,
                 )
             )
         return items
 
-    def collect(self, now: datetime) -> tuple[list[NewsItem], list[dict[str, Any]]]:
+    def collect(
+        self, now: datetime
+    ) -> tuple[list[NewsItem], list[dict[str, Any]], list[dict[str, Any]]]:
         items: list[NewsItem] = []
         errors: list[dict[str, Any]] = []
+        recoveries: list[dict[str, Any]] = []
         first_collection = not self.store.baseline_complete()
         items.extend(
             self._collect_feeds(
-                list(self.config["official_feeds"]), "primary", now, errors
+                list(self.config["official_feeds"]),
+                "primary",
+                now,
+                errors,
+                recoveries,
             )
         )
 
@@ -207,6 +227,7 @@ class RadarService:
                 "secondary",
                 now,
                 errors,
+                recoveries,
             )
             discovery_items.extend(
                 self._source_call(
@@ -214,6 +235,8 @@ class RadarService:
                     lambda: self.gnews.collect(now, now.astimezone(SGT)),
                     now,
                     errors,
+                    recoveries,
+                    "secondary",
                 )
             )
             items.extend(discovery_items)
@@ -230,6 +253,8 @@ class RadarService:
                         lambda: self.gdelt.collect(now, now.astimezone(SGT)),
                         now,
                         errors,
+                        recoveries,
+                        "secondary",
                     )
                 )
 
@@ -238,9 +263,17 @@ class RadarService:
             or self._cycle % int(self.config["structured"]["interval_cycles"]) == 0
         )
         if bool(self.config["structured"]["fmp_enabled"]) and structured_due:
+            # FMP is the only source of scheduled macro and earnings releases:
+            # losing it is closer to losing an official feed than to losing one
+            # of eleven discovery feeds, so it alerts on the strict threshold.
             items.extend(
                 self._source_call(
-                    "fmp_macro", lambda: self.fmp.collect_macro(now), now, errors
+                    "fmp_macro",
+                    lambda: self.fmp.collect_macro(now),
+                    now,
+                    errors,
+                    recoveries,
+                    "primary",
                 )
             )
             items.extend(
@@ -249,9 +282,11 @@ class RadarService:
                     lambda: self.fmp.collect_earnings(now),
                     now,
                     errors,
+                    recoveries,
+                    "primary",
                 )
             )
-        return items, errors
+        return items, errors, recoveries
 
     def _is_near_duplicate(self, item: NewsItem, now: datetime) -> bool:
         if self.store.item_seen(item.identity):
@@ -455,26 +490,53 @@ class RadarService:
                 )
         return completed
 
+    def _alert_threshold(self, tier: str) -> int:
+        """Consecutive failures needed before a source is worth interrupting for.
+
+        Thresholds are counts, but the wall-clock meaning depends on the cadence
+        of the source. Official feeds run every cycle; discovery feeds run once
+        per ``discovery.interval_cycles``, so the same count is ten times longer
+        there and a routine CDN hiccup used to page at thirty minutes.
+        """
+        runtime = self.config["runtime"]
+        if tier == "primary":
+            return int(runtime["source_failure_alert_after"])
+        return int(
+            runtime.get("source_failure_alert_after_discovery")
+            or runtime["source_failure_alert_after"]
+        )
+
     def _source_error_alerts(self, errors: list[dict[str, Any]], now: datetime) -> None:
-        threshold = int(self.config["runtime"]["source_failure_alert_after"])
         cooldown = float(self.config["runtime"]["source_error_cooldown_hours"])
+        realert = float(self.config["runtime"].get("source_realert_minutes") or 0)
         rate_threshold = float(self.config["runtime"]["source_failure_alert_rate"])
         rate_min_attempts = int(self.config["runtime"]["source_failure_rate_min_calls"])
         for error in errors:
+            threshold = self._alert_threshold(str(error.get("tier") or "secondary"))
             attempts = int(error.get("window_attempts") or 0)
             failures = int(error.get("window_failures") or 0)
             rate = failures / attempts if attempts else 0.0
             # A source that fails one call in three never reaches a consecutive
             # failure count of 3, so the rate is a second, independent trigger.
-            flapping = attempts >= rate_min_attempts and rate >= rate_threshold
+            # It still has to clear the tier threshold in total failures, or a
+            # source that broke right after a window reset would alert on the
+            # rate before its tier's consecutive bar was ever reached.
+            flapping = (
+                attempts >= rate_min_attempts
+                and failures >= threshold
+                and rate >= rate_threshold
+            )
             if int(error["failures"]) < threshold and not flapping:
                 continue
             source_id = str(error["source_id"])
-            if not self.store.source_alert_due(source_id, now, cooldown):
+            if not self.store.source_alert_due(source_id, now, cooldown, realert):
                 continue
+            # Name the trigger that actually fired. A source down six cycles in
+            # a row is also a 100% failure rate, and reporting it as a rate hid
+            # the simpler and more actionable fact.
             detail = (
                 f"连续失败 {int(error['failures'])} 次"
-                if not flapping
+                if int(error["failures"]) >= threshold
                 else f"{attempts} 次调用失败 {failures} 次（{rate:.0%}）"
             )
             text = (
@@ -495,6 +557,37 @@ class RadarService:
             )
             if self._deliver_or_queue(message, self.monitor_thread_id, now):
                 self.store.mark_source_alerted(source_id, now)
+
+    def _source_recovery_alerts(
+        self, recoveries: list[dict[str, Any]], now: datetime
+    ) -> None:
+        """Close every outage that was announced, so no alert stays open.
+
+        Without this the operator holds a warning that says a source is down and
+        has no way to learn it came back ten minutes later.
+        """
+        for recovery in recoveries:
+            source_id = str(recovery["source_id"])
+            minutes = recovery.get("outage_minutes")
+            duration = f"中断 {int(minutes)} 分钟 · " if minutes is not None else ""
+            text = (
+                "✅ <b>新闻雷达数据源恢复</b>\n"
+                f"<blockquote>{html.escape(source_id)} 已恢复\n"
+                f"{duration}连续失败 {int(recovery['failures'])} 次</blockquote>\n"
+                f"<i>{now.astimezone(SGT).strftime('%Y-%m-%d %H:%M')} SGT · "
+                f"global-news-radar/{__version__}</i>"
+            )
+            message = RenderedMessage(
+                level="P1",
+                html=text,
+                plain_text=strip_html(text),
+                event_keys=[f"source-recovery:{source_id}"],
+                content_hash=stable_hash(text, 32),
+                evidence=[recovery],
+                created_at=now,
+            )
+            if self._deliver_or_queue(message, self.monitor_thread_id, now):
+                self.store.mark_source_recovered(source_id, now)
 
     def _freshness_filter(
         self, items: list[NewsItem], now: datetime
@@ -526,7 +619,9 @@ class RadarService:
         self.readonly = True
         self.rss.readonly = True
         try:
-            items, errors = self.collect(now)
+            # Readonly never records a success, so it can never observe a
+            # recovery and must never announce one.
+            items, errors, _ = self.collect(now)
             fresh, rejected = self._freshness_filter(items, now)
             preview: list[dict[str, Any]] = []
             for item in fresh:
@@ -567,7 +662,7 @@ class RadarService:
         self._cycle += 1
         self.store.set_meta("cycle_count", str(self._cycle), now)
         retries = self.retry_due_deliveries(now)
-        items, errors = self.collect(now)
+        items, errors, recoveries = self.collect(now)
         fresh, rejected = self._freshness_filter(items, now)
 
         first_run = not self.store.baseline_complete()
@@ -640,6 +735,7 @@ class RadarService:
                 ):
                     sent += 1
 
+        self._source_recovery_alerts(recoveries, now)
         self._source_error_alerts(errors, now)
         self.store.prune(
             now,
@@ -667,6 +763,7 @@ class RadarService:
             "retries": retries,
             "rejected": rejected,
             "source_errors": errors,
+            "source_recoveries": [str(r["source_id"]) for r in recoveries],
             "pending_deliveries": pending_count,
             "deadletter_deliveries": deadletter_count,
         }

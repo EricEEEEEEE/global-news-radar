@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .models import NewsItem, RenderedMessage
 from .util import SGT, json_dumps
@@ -99,18 +100,20 @@ CREATE TABLE IF NOT EXISTS source_health (
     last_alert_at TEXT,
     window_start_at TEXT,
     window_attempts INTEGER NOT NULL DEFAULT 0,
-    window_failures INTEGER NOT NULL DEFAULT 0
+    window_failures INTEGER NOT NULL DEFAULT 0,
+    failure_started_at TEXT,
+    recovered_at TEXT
 );
 """
 
 
 # Infrastructure alerts travel through the same delivery path as market events.
 # They must never reach seen_topics or the exported market-event ledger.
-INFRA_EVENT_PREFIX = "source-error:"
+INFRA_EVENT_PREFIXES = ("source-error:", "source-recovery:")
 
 
 def is_infra_event(event_key: str) -> bool:
-    return event_key.startswith(INFRA_EVENT_PREFIX)
+    return event_key.startswith(INFRA_EVENT_PREFIXES)
 
 
 def _iso(value: datetime) -> str:
@@ -138,6 +141,8 @@ class RadarStore:
                 ("window_start_at", "TEXT"),
                 ("window_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("window_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("failure_started_at", "TEXT"),
+                ("recovered_at", "TEXT"),
             ),
             "observations": (("simhash", "TEXT NOT NULL DEFAULT ''"),),
         }
@@ -151,6 +156,20 @@ class RadarStore:
                     self.connection.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
                     )
+        # A deployment inherits rows that were alerted before recovered_at
+        # existed. Left NULL they look like still-open incidents, so the first
+        # blip after the upgrade would announce the recovery of an outage that
+        # closed before the upgrade. Closing them at their own alert time also
+        # keeps their next alert on the pre-existing cooldown rather than the
+        # shorter post-recovery gap.
+        self.connection.execute(
+            """
+            UPDATE source_health SET recovered_at=last_alert_at
+            WHERE consecutive_failures = 0
+              AND last_alert_at IS NOT NULL
+              AND recovered_at IS NULL
+            """
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -664,7 +683,45 @@ class RadarStore:
 
     def source_success(
         self, source_id: str, now: datetime, window_hours: float = 6.0
-    ) -> None:
+    ) -> dict[str, Any] | None:
+        """Record a successful call, reporting a recovery worth announcing.
+
+        A recovery is only worth announcing when the operator was told about the
+        outage in the first place, so the caller alerted on it (``last_alert_at``)
+        and that alert belongs to the incident that is closing now rather than to
+        an older one that already got its own recovery notice.
+        """
+        previous = self.connection.execute(
+            """
+            SELECT consecutive_failures, last_alert_at, failure_started_at,
+                   recovered_at
+            FROM source_health WHERE source_id=?
+            """,
+            (source_id,),
+        ).fetchone()
+        recovery: dict[str, Any] | None = None
+        if previous and int(previous["consecutive_failures"] or 0) > 0:
+            alerted = previous["last_alert_at"]
+            recovered = previous["recovered_at"]
+            open_incident = bool(alerted) and (
+                not recovered
+                or datetime.fromisoformat(str(alerted))
+                > datetime.fromisoformat(str(recovered))
+            )
+            if open_incident:
+                started = previous["failure_started_at"]
+                recovery = {
+                    "source_id": source_id,
+                    "failures": int(previous["consecutive_failures"]),
+                    "outage_minutes": (
+                        round(
+                            (now - datetime.fromisoformat(str(started))).total_seconds()
+                            / 60
+                        )
+                        if started
+                        else None
+                    ),
+                }
         self.connection.execute(
             """
             INSERT INTO source_health(source_id, consecutive_failures, last_success_at)
@@ -678,21 +735,31 @@ class RadarStore:
         )
         self._bump_window(source_id, now, window_hours, failed=False)
         self.connection.commit()
+        return recovery
 
     def source_failure(
         self, source_id: str, error: str, now: datetime, window_hours: float = 6.0
     ) -> int:
+        # failure_started_at anchors the outage clock. It moves only on the
+        # 0 -> 1 transition, so the recovery notice can report how long the
+        # source was actually down rather than how long ago it last succeeded.
         self.connection.execute(
             """
             INSERT INTO source_health(
-                source_id, consecutive_failures, last_failure_at, last_error
-            ) VALUES(?, 1, ?, ?)
+                source_id, consecutive_failures, last_failure_at, last_error,
+                failure_started_at
+            ) VALUES(?, 1, ?, ?, ?)
             ON CONFLICT(source_id) DO UPDATE SET
                 consecutive_failures=source_health.consecutive_failures+1,
                 last_failure_at=excluded.last_failure_at,
-                last_error=excluded.last_error
+                last_error=excluded.last_error,
+                failure_started_at=CASE
+                    WHEN source_health.consecutive_failures = 0
+                    THEN excluded.failure_started_at
+                    ELSE source_health.failure_started_at
+                END
             """,
-            (source_id, _iso(now), error[:500]),
+            (source_id, _iso(now), error[:500], _iso(now)),
         )
         self._bump_window(source_id, now, window_hours, failed=True)
         self.connection.commit()
@@ -716,20 +783,43 @@ class RadarStore:
         return int(row["window_attempts"] or 0), int(row["window_failures"] or 0)
 
     def source_alert_due(
-        self, source_id: str, now: datetime, cooldown_hours: float
+        self,
+        source_id: str,
+        now: datetime,
+        cooldown_hours: float,
+        realert_minutes: float = 0.0,
     ) -> bool:
         row = self.connection.execute(
-            "SELECT last_alert_at FROM source_health WHERE source_id=?", (source_id,)
+            "SELECT last_alert_at, recovered_at FROM source_health WHERE source_id=?",
+            (source_id,),
         ).fetchone()
         if not row or not row["last_alert_at"]:
             return True
-        return now - datetime.fromisoformat(str(row["last_alert_at"])) >= timedelta(
-            hours=cooldown_hours
-        )
+        last_alert = datetime.fromisoformat(str(row["last_alert_at"]))
+        recovered = row["recovered_at"]
+        if recovered:
+            recovered_at = datetime.fromisoformat(str(recovered))
+            if recovered_at > last_alert:
+                # The alerted incident already closed and was announced as
+                # recovered. A fresh outage is a new incident and deserves its
+                # own alert, but a flapping source must not alert every time it
+                # bounces, so it still has to clear the post-recovery gap.
+                return now - recovered_at >= timedelta(minutes=realert_minutes)
+        return now - last_alert >= timedelta(hours=cooldown_hours)
 
     def mark_source_alerted(self, source_id: str, now: datetime) -> None:
         self.connection.execute(
             "UPDATE source_health SET last_alert_at=? WHERE source_id=?",
+            (_iso(now), source_id),
+        )
+        self.connection.commit()
+
+    def mark_source_recovered(self, source_id: str, now: datetime) -> None:
+        # last_alert_at is deliberately left in place: source_alert_due compares
+        # the two timestamps to tell "incident still open" from "incident closed,
+        # a new one may alert again".
+        self.connection.execute(
+            "UPDATE source_health SET recovered_at=? WHERE source_id=?",
             (_iso(now), source_id),
         )
         self.connection.commit()
@@ -779,13 +869,16 @@ class RadarStore:
         # json_each expands one row per event_key and joins on an exact match.
         # The old instr() join matched any key that was a substring of the JSON
         # blob, multiplying rows and pairing keys with the wrong summary.
+        infra_filter = " AND ".join(
+            f"k.value NOT LIKE '{prefix}%'" for prefix in INFRA_EVENT_PREFIXES
+        )
         rows = self.connection.execute(
             f"""
             SELECT d.sent_at, k.value AS event_key, d.content_hash, t.last_summary
             FROM deliveries d
             JOIN json_each(d.event_keys_json) k
             LEFT JOIN seen_topics t ON t.event_key = k.value
-            WHERE k.value NOT LIKE '{INFRA_EVENT_PREFIX}%'
+            WHERE {infra_filter}
             ORDER BY d.sent_at ASC, k.value ASC
             """
         ).fetchall()

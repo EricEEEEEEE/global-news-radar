@@ -125,6 +125,24 @@ and `21:00–21:30` quiet window. Edit `config/radar.yaml` to:
 
 Telegram credentials and routes belong in `.env`, never in tracked configuration.
 
+## Source-health alerts
+
+A consecutive-failure threshold is a count, and the wall-clock time it buys
+depends on how often the source is polled, so the threshold is split by tier:
+
+- official feeds and FMP use `source_failure_alert_after` (3). Official feeds run
+  every cycle, so that is about six minutes;
+- discovery feeds use `source_failure_alert_after_discovery` (6). They only run
+  once per `discovery.interval_cycles`, so three failures was half an hour of a
+  commercial CDN hiccup — a poor reason to interrupt someone when ten other
+  discovery feeds are still reporting.
+
+An announced outage is closed by a `✅ source recovered` notice carrying its
+duration, so a warning never hangs around with no way to learn it ended. Closing
+the incident also lets a genuinely new outage alert again rather than waiting out
+`source_error_cooldown_hours`, but it must first clear `source_realert_minutes`
+so a flapping source cannot alert on every bounce.
+
 ## State and evidence
 
 - `state/radar.sqlite3` — dedupe, delivery, source-health, P1, and lineage state.

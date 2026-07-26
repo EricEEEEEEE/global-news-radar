@@ -1,4 +1,4 @@
-version: "1.2.0"
+version: "1.2.1"
 timezone: Asia/Singapore
 poll_seconds: 120
 freshness_minutes: 75
@@ -23,7 +23,17 @@ telegram:
   max_visible_chars: 400
 runtime:
   baseline_on_first_run: true
+  # Consecutive-failure thresholds are counts, and the wall-clock they buy
+  # depends on how often the source is polled. Official feeds run every cycle
+  # (2 min), so 3 is ~6 minutes; FMP runs every structured.interval_cycles.
+  # Discovery feeds run every discovery.interval_cycles (10 min), so 3 was only
+  # 30 minutes of a commercial CDN hiccup -- 6 makes it a full hour before one
+  # of eleven discovery feeds is allowed to interrupt.
   source_failure_alert_after: 3
+  source_failure_alert_after_discovery: 6
+  # After a recovery is announced the incident is closed, so a new outage may
+  # alert again. This gap keeps a flapping source from alerting every bounce.
+  source_realert_minutes: 60
   source_failure_alert_rate: 0.5
   source_failure_rate_min_calls: 4
   source_health_window_hours: 6
