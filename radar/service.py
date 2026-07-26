@@ -913,7 +913,9 @@ class RadarService:
         LOGGER.info("service_stop")
 
 
-def check_health(root: Path, max_age_seconds: int = 600) -> tuple[bool, dict[str, Any]]:
+def check_health(
+    root: Path, max_age_seconds: int = 600, now: datetime | None = None
+) -> tuple[bool, dict[str, Any]]:
     path = root / "state" / "heartbeat.json"
     if not path.exists():
         return False, {"status": "missing_heartbeat", "path": str(path)}
@@ -930,7 +932,7 @@ def check_health(root: Path, max_age_seconds: int = 600) -> tuple[bool, dict[str
         }
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    age = (utc_now() - timestamp).total_seconds()
+    age = ((now or utc_now()) - timestamp).total_seconds()
     deadletters = int(payload.get("stats", {}).get("deadletter_deliveries", 0))
     healthy = age <= max_age_seconds and deadletters == 0
     if age > max_age_seconds:

@@ -112,6 +112,34 @@ Health check:
 .venv/bin/python main.py health --max-age-seconds 600
 ```
 
+## Liveness watchdog
+
+The daemon reports its own source failures, but a process that has died cannot
+report that it died. `watchdog` closes that gap: it reads only the heartbeat,
+keeps its own small state file, and never opens the SQLite database or the
+outbox — a locked database is one of the failures it has to be able to report.
+
+```bash
+.venv/bin/python main.py watchdog --max-age-seconds 900 --send
+```
+
+Run it from cron rather than from the Supervisor that owns the daemon, so
+Supervisor going down does not take the alarm with it:
+
+```cron
+*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >> logs/watchdog.log 2>&1
+```
+
+It alerts on the transition, not on every run: the first failure sends one
+message to the monitor topic, `watchdog_alert_cooldown_hours` covers the rest of
+the outage, and a `✅ recovered` notice with the outage duration closes it. An
+outage that was never announced produces no lone recovery notice. Without
+`--send` the check runs and prints only. Exit status is `0` healthy, `1` not, so
+cron mail or an external ping service can key off it too.
+
+This cannot report a host that is entirely down — nothing running on that host
+can. It covers the daemon, not the machine.
+
 Export confirmed deliveries:
 
 ```bash

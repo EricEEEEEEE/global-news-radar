@@ -1,4 +1,4 @@
-version: "1.3.0"
+version: "1.4.0"
 timezone: Asia/Singapore
 poll_seconds: 120
 freshness_minutes: 75
@@ -41,6 +41,11 @@ runtime:
   source_retry_attempts: 2
   delivery_retry_minutes: 10
   delivery_max_attempts: 6
+  # The watchdog runs from cron every few minutes. A dead daemon stays dead
+  # until someone acts, so repeating the alarm every run only trains the
+  # operator to ignore it; one alert per outage plus a recovery notice is the
+  # whole signal.
+  watchdog_alert_cooldown_hours: 6
 llm:
   enabled: false
   model: ""

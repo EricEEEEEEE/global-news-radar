@@ -13,6 +13,86 @@ from .util import atomic_write, visible_length
 LOGGER = logging.getLogger(__name__)
 
 
+def telegram_payload(
+    *,
+    chat_id: str,
+    thread_id: str,
+    text: str,
+    parse_mode: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    topic_id = int(thread_id)
+    if topic_id > 0:
+        payload["message_thread_id"] = topic_id
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return payload
+
+
+def post_telegram(
+    *,
+    token: str,
+    chat_id: str,
+    thread_id: str,
+    html_text: str,
+    plain_text: str,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    """Send one message, degrading to complete plain text if HTML is rejected.
+
+    Kept separate from TelegramDelivery because the watchdog has to be able to
+    report that the daemon is down without touching the outbox files that hold
+    the evidence for the daemon's last real message.
+    """
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json=telegram_payload(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            text=html_text,
+            parse_mode="HTML",
+        ),
+        timeout=timeout,
+    )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Telegram non-JSON response status={response.status_code}"
+        ) from exc
+    if response.ok and payload.get("ok"):
+        return {
+            "message_id": str(payload["result"]["message_id"]),
+            "fallback": None,
+        }
+    description = str(payload.get("description") or response.text)[:300]
+    if "parse entities" not in description.lower():
+        raise RuntimeError(
+            f"Telegram send failed status={response.status_code}: {description}"
+        )
+    LOGGER.error("telegram_html_rejected; retrying plain text")
+    fallback = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json=telegram_payload(chat_id=chat_id, thread_id=thread_id, text=plain_text),
+        timeout=timeout,
+    )
+    fallback_payload = fallback.json()
+    if not fallback.ok or not fallback_payload.get("ok"):
+        raise RuntimeError(
+            f"Telegram send failed status={response.status_code}: {description}"
+        )
+    return {
+        "message_id": str(fallback_payload["result"]["message_id"]),
+        "fallback": "plain_text",
+    }
+
+
 class TelegramDelivery:
     def __init__(
         self,
@@ -36,17 +116,12 @@ class TelegramDelivery:
         text: str,
         parse_mode: str | None = None,
     ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        }
-        topic_id = int(thread_id)
-        if topic_id > 0:
-            payload["message_thread_id"] = topic_id
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        return payload
+        return telegram_payload(
+            chat_id=self.chat_id,
+            thread_id=thread_id,
+            text=text,
+            parse_mode=parse_mode,
+        )
 
     def _write_outbox(
         self, message: RenderedMessage, delivery: dict[str, object]
@@ -72,58 +147,26 @@ class TelegramDelivery:
         self._write_outbox(message, prepared)
         if not self.send_enabled:
             return {"ok": True, "dry_run": True, "message_id": "dry-run"}
-        if not self.token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-        response = requests.post(
-            f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json=self._payload(
-                thread_id=thread_id,
-                text=message.html,
-                parse_mode="HTML",
-            ),
-            timeout=20,
+        result = post_telegram(
+            token=self.token,
+            chat_id=self.chat_id,
+            thread_id=thread_id,
+            html_text=message.html,
+            plain_text=message.plain_text,
         )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Telegram non-JSON response status={response.status_code}"
-            ) from exc
-        if not response.ok or not payload.get("ok"):
-            description = str(payload.get("description") or response.text)[:300]
-            if "parse entities" in description.lower():
-                LOGGER.error("telegram_html_rejected; retrying plain text")
-                fallback = requests.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    json=self._payload(
-                        thread_id=thread_id,
-                        text=message.plain_text,
-                    ),
-                    timeout=20,
-                )
-                fallback_payload = fallback.json()
-                if fallback.ok and fallback_payload.get("ok"):
-                    message_id = str(fallback_payload["result"]["message_id"])
-                    delivered = {
-                        "status": "sent_plain_fallback",
-                        "thread_id": thread_id,
-                        "message_id": message_id,
-                    }
-                    self._write_outbox(message, delivered)
-                    return {
-                        "ok": True,
-                        "dry_run": False,
-                        "message_id": message_id,
-                        "fallback": "plain_text",
-                    }
-            raise RuntimeError(
-                f"Telegram send failed status={response.status_code}: {description}"
-            )
-        message_id = str(payload["result"]["message_id"])
+        message_id = result["message_id"]
+        fallback = result["fallback"]
         delivered = {
-            "status": "sent",
+            "status": "sent_plain_fallback" if fallback else "sent",
             "thread_id": thread_id,
             "message_id": message_id,
         }
         self._write_outbox(message, delivered)
-        return {"ok": True, "dry_run": False, "message_id": message_id}
+        sent: dict[str, Any] = {
+            "ok": True,
+            "dry_run": False,
+            "message_id": message_id,
+        }
+        if fallback:
+            sent["fallback"] = fallback
+        return sent

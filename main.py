@@ -11,6 +11,7 @@ from pathlib import Path
 from radar.config import load_config
 from radar.service import RadarService, check_health
 from radar.util import RedactingFormatter, load_env, register_secrets
+from radar.watchdog import run_watchdog
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     health = sub.add_parser("health", help="check heartbeat freshness")
     health.add_argument("--max-age-seconds", type=int, default=600)
+
+    watchdog = sub.add_parser(
+        "watchdog", help="alert to Telegram when the daemon stops reporting"
+    )
+    watchdog.add_argument("--max-age-seconds", type=int, default=900)
+    watchdog.add_argument(
+        "--send",
+        action="store_true",
+        help="actually send; without it the check runs and prints only",
+    )
 
     export = sub.add_parser("export", help="export sent events for Daily Brief")
     export.add_argument("--output", type=Path)
@@ -87,6 +98,19 @@ def main() -> int:
     if args.command == "health":
         ok, payload = check_health(root, args.max_age_seconds)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    # The watchdog runs from cron while the daemon owns the process, so it is
+    # built without RadarService: it must not open the store the daemon writes.
+    if args.command == "watchdog":
+        ok, report = run_watchdog(
+            root,
+            config,
+            env,
+            max_age_seconds=args.max_age_seconds,
+            send_enabled=bool(args.send),
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if ok else 1
 
     send_enabled = bool(getattr(args, "send", False))

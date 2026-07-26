@@ -65,11 +65,36 @@ RADAR_LLM_ENABLED=true
 # heartbeat 检查
 .venv/bin/python main.py health --max-age-seconds 600
 
+# 存活看门狗，异常推 monitor topic（不带 --send 只检查不发）
+.venv/bin/python main.py watchdog --max-age-seconds 900 --send
+
 # 导出下游日报兼容 ledger
 .venv/bin/python main.py export
 ```
 
 首次启动只建立当前 75 分钟候选的 baseline，绝不补推历史。
+
+## 存活看门狗
+
+守护进程能报自己的源故障，但**已经死掉的进程报不了自己死了**，卡在某一轮的同样报不了。
+`watchdog` 只补这一个洞，因此刻意不依赖被监控的东西：只读 `state/heartbeat.json`，
+自己写一个独立的小 JSON 状态，**不开守护进程的 SQLite，也不写它的 outbox**——数据库
+被锁或损坏本身就是它必须能报出来的故障之一，靠那个文件发告警等于没有。
+
+必须挂 cron，不要挂在管着守护进程的那个 Supervisor 下面，否则 Supervisor 一倒，
+警报跟着一起没了：
+
+```cron
+*/10 * * * * cd /path/to/global-news-radar && ./.venv/bin/python main.py --root . watchdog --send >> logs/watchdog.log 2>&1
+```
+
+告警只在**状态跳变**时发，不是每轮都发：第一次失败发一条到 monitor topic，
+`watchdog_alert_cooldown_hours`（默认 6h）盖住中断的其余时间，恢复后补一条
+`✅ 新闻雷达恢复` 带中断时长把事件关掉。从没告警过的抖动不会单独冒出一条「恢复」。
+退出码 0 健康 / 1 不健康，cron 邮件或外部 ping 服务也能直接用。
+
+**边界**：整台机器宕了它报不出来——跑在这台机器上的任何东西都报不出来。它看的是
+守护进程，不是主机。
 
 ## 源健康告警
 

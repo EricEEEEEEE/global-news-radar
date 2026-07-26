@@ -30,6 +30,7 @@ from radar.util import (
     simhash64,
     visible_length,
 )
+from radar.watchdog import run_watchdog
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = load_config(ROOT / "config" / "radar.yaml")
@@ -1465,6 +1466,177 @@ class ServiceIntegrationTests(unittest.TestCase):
             self.assertEqual(service.summarizer.model, "legacy-model")
             self.assertEqual(redact_secrets("legacy-key leaked"), "*** leaked")
             service.close()
+
+
+class WatchdogTests(unittest.TestCase):
+    """The watchdog is what reports a daemon that cannot report itself."""
+
+    def _heartbeat(
+        self, root: Path, *, age_seconds: float, deadletters: int = 0
+    ) -> None:
+        root.joinpath("state").mkdir(parents=True, exist_ok=True)
+        stamp = NOW - timedelta(seconds=age_seconds)
+        root.joinpath("state", "heartbeat.json").write_text(
+            json.dumps(
+                {
+                    "timestamp": stamp.isoformat(),
+                    "stats": {"deadletter_deliveries": deadletters},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(
+        self,
+        root: Path,
+        *,
+        now: datetime = NOW,
+        env: dict[str, str] | None = None,
+    ) -> tuple[bool, dict, mock.Mock]:
+        sent = mock.Mock(
+            return_value={"message_id": "1", "fallback": None},
+        )
+        with mock.patch("radar.watchdog.post_telegram", sent):
+            healthy, report = run_watchdog(
+                root,
+                CONFIG,
+                {"TELEGRAM_BOT_TOKEN": "wd-token", **(env or {})},
+                max_age_seconds=900,
+                send_enabled=True,
+                now=now,
+            )
+        return healthy, report, sent
+
+    def test_healthy_daemon_stays_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=60)
+            healthy, report, sent = self._run(root)
+        self.assertTrue(healthy)
+        self.assertFalse(report["alerted"])
+        sent.assert_not_called()
+
+    def test_stale_heartbeat_alerts_once_then_respects_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=4000)
+            healthy, first, sent = self._run(root)
+            self.assertFalse(healthy)
+            self.assertTrue(first["alerted"])
+            body = sent.call_args.kwargs["html_text"]
+            # A second cron run an hour later must not re-alarm: a dead daemon
+            # stays dead, and repeating it only teaches the operator to ignore it.
+            _, second, resent = self._run(root, now=NOW + timedelta(hours=1))
+            self.assertFalse(second["alerted"])
+            resent.assert_not_called()
+            # Past the cooldown the outage is worth restating.
+            _, third, third_send = self._run(root, now=NOW + timedelta(hours=7))
+        self.assertIn("新闻雷达停摆", body)
+        self.assertIn("心跳过期", body)
+        self.assertTrue(third["alerted"])
+        third_send.assert_called_once()
+
+    def test_recovery_closes_an_announced_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=4000)
+            self._run(root)
+            later = NOW + timedelta(minutes=42)
+            self._heartbeat(root, age_seconds=-2520 + 60)  # fresh again at `later`
+            healthy, report, sent = self._run(root, now=later)
+            body = sent.call_args.kwargs["html_text"]
+        self.assertTrue(healthy)
+        self.assertTrue(report["recovered"])
+        self.assertEqual(report["outage_minutes"], 42)
+        self.assertIn("新闻雷达恢复", body)
+        self.assertIn("42", body)
+
+    def test_blip_that_never_alerted_sends_no_lone_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=60)
+            healthy, report, sent = self._run(root)
+        self.assertTrue(healthy)
+        self.assertFalse(report["recovered"])
+        sent.assert_not_called()
+
+    def test_deadletters_are_reported_even_with_a_fresh_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=60, deadletters=2)
+            healthy, report, sent = self._run(root)
+            body = sent.call_args.kwargs["html_text"]
+        self.assertFalse(healthy)
+        self.assertEqual(report["status"], "deadletter")
+        self.assertIn("死信 2 条", body)
+
+    def test_missing_heartbeat_alerts_to_the_monitor_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath("state").mkdir(parents=True)
+            healthy, report, sent = self._run(root)
+            kwargs = sent.call_args.kwargs
+        self.assertFalse(healthy)
+        self.assertEqual(report["status"], "missing_heartbeat")
+        # Blank env means "not set" here exactly as it does for the daemon, so
+        # the two cannot drift into routing infra alerts to different topics.
+        self.assertEqual(kwargs["thread_id"], MONITOR_THREAD)
+        self.assertEqual(kwargs["chat_id"], str(CONFIG["telegram"]["chat_id"]))
+
+    def test_environment_overrides_the_monitor_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath("state").mkdir(parents=True)
+            _, _, sent = self._run(
+                root,
+                env={"TELEGRAM_CHAT_ID": "-100777", "TELEGRAM_MONITOR_THREAD_ID": "61"},
+            )
+            kwargs = sent.call_args.kwargs
+        self.assertEqual(kwargs["chat_id"], "-100777")
+        self.assertEqual(kwargs["thread_id"], "61")
+
+    def test_a_failed_alert_is_retried_next_run(self) -> None:
+        # Recording the alert before Telegram confirmed it would swallow the
+        # only warning the operator gets for the whole cooldown.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=4000)
+            broken = mock.Mock(side_effect=RuntimeError("telegram down"))
+            with mock.patch("radar.watchdog.post_telegram", broken):
+                _, failed = run_watchdog(
+                    root,
+                    CONFIG,
+                    {"TELEGRAM_BOT_TOKEN": "wd-token"},
+                    max_age_seconds=900,
+                    send_enabled=True,
+                    now=NOW,
+                )
+            _, retried, sent = self._run(root, now=NOW + timedelta(minutes=5))
+        self.assertFalse(failed["alerted"])
+        self.assertIn("telegram down", failed["send_error"])
+        self.assertTrue(retried["alerted"])
+        sent.assert_called_once()
+
+    def test_corrupt_watchdog_state_does_not_stop_the_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=4000)
+            root.joinpath("state", "watchdog.json").write_text("{not json", "utf-8")
+            healthy, report, sent = self._run(root)
+        self.assertFalse(healthy)
+        self.assertTrue(report["alerted"])
+        sent.assert_called_once()
+
+    def test_watchdog_never_touches_daemon_state(self) -> None:
+        # A locked or corrupt SQLite file is one of the failures the watchdog
+        # has to report, so it must not need that file to do its job.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._heartbeat(root, age_seconds=4000)
+            self._run(root)
+            written = {p.name for p in root.joinpath("state").iterdir()}
+        self.assertEqual(written, {"heartbeat.json", "watchdog.json"})
+        self.assertFalse(root.joinpath("outbox").exists())
 
 
 if __name__ == "__main__":
