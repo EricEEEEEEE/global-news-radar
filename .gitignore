@@ -1,4 +1,9 @@
 .env
+# A credential file survives being renamed. Ignoring only ".env" means the
+# backup an operator takes before editing it -- .env.bak, .env.old, .env.2 --
+# is the one thing in the directory that git will happily stage.
+.env.*
+!.env.example
 .venv/
 __pycache__/
 .pytest_cache/
