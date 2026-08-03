@@ -208,12 +208,38 @@ def numeric_values(value: str) -> set[str]:
     return {normalize_number(token) for token in numeric_tokens(value)}
 
 
+# English scale words next to a number, e.g. "$8 billion", "3.8bn", "500k".
+_SCALE_RE = re.compile(
+    r"([+-]?\d[\d,]*(?:\.\d+)?)\s*(trillion|billion|million|thousand|tn|bn|mn|[kmbt])"
+    r"(?![a-z])",
+    re.IGNORECASE,
+)
+# Chinese rewrites the magnitude into 万/亿 units, so the digits change:
+# $8 billion becomes 80亿, $3.8 billion becomes 38亿, 5 million becomes 500万.
+# Each factor is the digit shift that Chinese-scale wording produces.
+_SCALE_FACTORS = {
+    "trillion": (Decimal(1), Decimal(10000)),  # 8万亿 / 80000亿
+    "tn": (Decimal(1), Decimal(10000)),
+    "t": (Decimal(1), Decimal(10000)),
+    "billion": (Decimal(10),),  # 80亿
+    "bn": (Decimal(10),),
+    "b": (Decimal(10),),
+    "million": (Decimal(100),),  # 800万
+    "mn": (Decimal(100),),
+    "m": (Decimal(100),),
+    "thousand": (Decimal(1000),),  # 8000
+    "k": (Decimal(1000),),
+}
+
+
 def echoable_numbers(value: str) -> set[str]:
     """Numbers a faithful translation may contain, given this source text.
 
     Wider than what the tokeniser sees literally: rendering a month name or a
-    quarter label in Chinese turns Jul into 7月 and Q2 into 第2季度, producing
-    digits the English source never spelled out as digits.
+    quarter label in Chinese turns Jul into 7月 and Q2 into 第2季度, and an
+    English scale word rescales the digits themselves — "$8 billion" is
+    correctly written 80亿, which is a "new" number only to a byte-level
+    comparison. Four real alerts fell back to English over exactly that.
     """
     allowed = numeric_values(value)
     glued = _GLUED_DIGIT_RE.findall(value or "")
@@ -222,6 +248,13 @@ def echoable_numbers(value: str) -> set[str]:
     for name, number in _MONTH_NUMBERS.items():
         if re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", lowered):
             allowed.add(number)
+    for match in _SCALE_RE.finditer(value or ""):
+        try:
+            base = Decimal(match.group(1).replace(",", "").lstrip("+"))
+        except InvalidOperation:
+            continue
+        for factor in _SCALE_FACTORS[match.group(2).lower()]:
+            allowed.add(format((base * factor).normalize(), "f"))
     return allowed
 
 

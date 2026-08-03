@@ -21,7 +21,7 @@ from radar.render import outbox_manifest, render_p0, render_p1, validate_html
 from radar.service import RadarService, check_health
 from radar.sources import FmpCollector
 from radar.store import RadarStore
-from radar.summarizer import LlmSummarizer, Summary
+from radar.summarizer import LlmSummarizer, Summary, bare_english_spans
 from radar.trending import TrendingJudge
 from radar.util import (
     SGT,
@@ -1808,6 +1808,28 @@ class NumberGuardTests(unittest.TestCase):
         written = "环比-0.14%，低于预期0.1%"
         self.assertTrue(numeric_values(written).issubset(echoable_numbers(source)))
 
+    def test_english_scale_words_allow_chinese_rescaling(self) -> None:
+        # 2026-08-03 production rejections ['80'], ['38'], ['2040'], ['100']:
+        # all were billion→亿 rescalings of correct translations.
+        cases = {
+            "up to $8 billion in cash": "80亿",
+            "a $3.8bn deal": "38亿",
+            "worth 204 billion pounds": "2040亿",
+            "a $10 billion pledge": "100亿",
+            "about 5 million users": "500万",
+            "roughly 12k staff": "12000",
+        }
+        for source, written in cases.items():
+            self.assertTrue(
+                numeric_values(written).issubset(echoable_numbers(source)),
+                f"{source} -> {written}",
+            )
+
+    def test_scale_words_do_not_open_the_gate_wide(self) -> None:
+        allowed = echoable_numbers("up to $8 billion in cash")
+        self.assertNotIn("81", allowed)
+        self.assertNotIn("800", allowed)
+
     def test_minus_sign_survives_a_chinese_character(self) -> None:
         # The old lookbehind treated CJK as a word character and dropped the
         # sign, turning -0.14 into 0.14 and reporting it as invented.
@@ -1925,6 +1947,97 @@ class LlmSummarizerTests(unittest.TestCase):
             summary = self._summarizer().summarize(event)
         self.assertEqual(summary.title, "经济数据大幅偏离")
         self.assertIn("ID Inflation Rate MoM", summary.fact)
+
+    def test_scale_conversion_is_not_invented(self) -> None:
+        # $8 billion correctly becomes 80亿; the gate rejected exactly this
+        # in production (message 26527) and shipped the English title instead.
+        event = self._event("Curium to acquire Lantheus for up to $8 billion in cash")
+        payload = {
+            "title": "居里制药收购朗特斯",
+            "fact": (
+                "Curium（居里制药）将以最高80亿美元现金收购"
+                "Lantheus（美国放射性药物公司）。"
+            ),
+            "impact": "相关行业格局可能变化。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post", return_value=self._reply(payload)
+        ) as post:
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.fact, payload["fact"])
+        self.assertEqual(len(post.call_args_list), 1)
+
+    def test_invented_number_recovers_via_feedback_retry(self) -> None:
+        event = self._event("ID Inflation Rate MoM (Jul): actual -0.14, estimate 0.1")
+        bad = {
+            "title": "印尼通胀转负",
+            "fact": "印尼7月CPI环比-0.14%，年化降幅达1.7%",
+            "impact": "利率预期可能调整。",
+        }
+        good = {
+            "title": "印尼通胀转负",
+            "fact": "印尼7月CPI环比-0.14%，低于预期0.1%",
+            "impact": "利率预期可能调整。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post",
+            side_effect=[self._reply(bad), self._reply(good)],
+        ) as post:
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.fact, good["fact"])
+        second_body = post.call_args_list[1].kwargs["json"]["messages"][1]["content"]
+        self.assertIn("revision_note", second_body)
+        self.assertIn("1.7", second_body)
+
+    def test_bare_english_recovers_via_retry(self) -> None:
+        event = self._event(
+            "Clearmind Medicine to acquire 51% stake in EV charging firm"
+        )
+        bare = {
+            "title": "医药公司跨界收购",
+            "fact": "Clearmind Medicine将收购EV充电公司51%股权",
+            "impact": "相关公司估值可能变化。",
+        }
+        glossed = {
+            "title": "医药公司跨界收购",
+            "fact": ("Clearmind Medicine（加拿大医药公司）将收购电动车充电公司51%股权"),
+            "impact": "相关公司估值可能变化。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post",
+            side_effect=[self._reply(bare), self._reply(glossed)],
+        ):
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.fact, glossed["fact"])
+
+    def test_stubborn_bare_english_still_beats_english_fallback(self) -> None:
+        event = self._event(
+            "Clearmind Medicine to acquire 51% stake in EV charging firm"
+        )
+        bare = {
+            "title": "医药公司跨界收购",
+            "fact": "Clearmind Medicine将收购EV充电公司51%股权",
+            "impact": "相关公司估值可能变化。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post", return_value=self._reply(bare)
+        ):
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.fact, bare["fact"])
+
+
+class BareEnglishSpanTests(unittest.TestCase):
+    def test_flags_unglossed_company_names(self) -> None:
+        self.assertEqual(
+            bare_english_spans("Clearmind Medicine将收购EV充电公司51%股权"),
+            ["Clearmind Medicine"],
+        )
+
+    def test_accepts_glossed_names_tickers_and_acronyms(self) -> None:
+        self.assertEqual(
+            bare_english_spans("Visa（维萨）收购案获批，TSLA 大涨，美国CPI回落"),
+            [],
+        )
 
 
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"x" * 2000
