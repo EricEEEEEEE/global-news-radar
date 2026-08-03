@@ -2004,6 +2004,30 @@ class PhotoDeliveryTests(unittest.TestCase):
             self.assertFalse(Path(directory, "latest.jpg").exists())
 
 
+class OutboxPruneTests(unittest.TestCase):
+    def test_prunes_old_files_but_keeps_latest(self) -> None:
+        from radar.delivery import prune_outbox
+
+        with tempfile.TemporaryDirectory() as directory:
+            outbox = Path(directory)
+            old = outbox / "20260701T000000Z-p0-aaaa.jpg"
+            fresh = outbox / "20260803T000000Z-p0-bbbb.jpg"
+            latest = outbox / "latest.jpg"
+            for path in (old, fresh, latest):
+                path.write_bytes(b"x")
+            now_timestamp = NOW.timestamp()
+            import os as _os
+
+            _os.utime(old, (now_timestamp - 10 * 86400,) * 2)
+            _os.utime(fresh, (now_timestamp - 3600,) * 2)
+            _os.utime(latest, (now_timestamp - 10 * 86400,) * 2)
+            removed = prune_outbox(outbox, now_timestamp, 7)
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(latest.exists())
+
+
 class ComicWiringTests(unittest.TestCase):
     def test_p0_publish_passes_comic_to_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

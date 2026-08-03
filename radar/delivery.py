@@ -14,6 +14,32 @@ from .util import atomic_write, atomic_write_bytes, redact_secrets, visible_leng
 LOGGER = logging.getLogger(__name__)
 
 
+def prune_outbox(outbox_dir: Path, now_timestamp: float, max_age_days: float) -> int:
+    """Delete outbox evidence older than the retention window.
+
+    The outbox held only small html/json files and could coast on disk being
+    cheap; comic JPEGs are two hundred times larger, so the same silence would
+    grow without bound. ``latest.*`` never expires: it is what the watchdog
+    and the operator read first.
+    """
+    cutoff = now_timestamp - max_age_days * 86400
+    removed = 0
+    if not outbox_dir.is_dir():
+        return 0
+    for path in outbox_dir.iterdir():
+        if not path.is_file() or path.name.startswith("latest."):
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        LOGGER.info("outbox_pruned files=%d", removed)
+    return removed
+
+
 def telegram_payload(
     *,
     chat_id: str,

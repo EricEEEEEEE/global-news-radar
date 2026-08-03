@@ -11,7 +11,7 @@ from typing import Any
 
 from . import __version__
 from .comic import ComicArtist
-from .delivery import TelegramDelivery
+from .delivery import TelegramDelivery, prune_outbox
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from .policy import assess, is_fresh, is_quiet_window, quiet_window_end
 from .render import render_p0, render_p1
@@ -791,6 +791,11 @@ class RadarService:
             int(self.config["topic_retention_days"]),
             item_retention_days=int(self.config["item_retention_days"]),
             delivery_retention_days=int(self.config["delivery_retention_days"]),
+        )
+        prune_outbox(
+            self.root / "outbox",
+            now.timestamp(),
+            float(self.config["item_retention_days"]),
         )
         pending_count, deadletter_count = self.store.pending_counts(
             int(self.config["runtime"]["delivery_max_attempts"])
