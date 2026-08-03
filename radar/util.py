@@ -9,6 +9,7 @@ import os
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -144,11 +145,84 @@ def visible_length(value: str) -> int:
     return len(strip_html(value))
 
 
+# The lookbehind excludes ASCII word characters only. `(?<!\w)` also excluded CJK,
+# so a minus sign written as 环比-0.14% was dropped and the token came out as a
+# positive 0.14% — the translated number then looked invented next to a source
+# that said -0.14. Digits and dots stay excluded so 2026-08-03 does not yield -8.
+_NUMBER_RE = re.compile(r"(?<![0-9A-Za-z_.])[+-]?\d[\d,]*(?:\.\d+)?%?")
+# Digits glued to letters: Q2, H1, FY26, 10Y. Used only to widen what the model is
+# allowed to echo, never to decide what it generated.
+_GLUED_DIGIT_RE = re.compile(r"(?<=[A-Za-z])\d+(?:\.\d+)?")
+
+_MONTH_NUMBERS = {
+    "january": "1",
+    "jan": "1",
+    "february": "2",
+    "feb": "2",
+    "march": "3",
+    "mar": "3",
+    "april": "4",
+    "apr": "4",
+    "may": "5",
+    "june": "6",
+    "jun": "6",
+    "july": "7",
+    "jul": "7",
+    "august": "8",
+    "aug": "8",
+    "september": "9",
+    "sep": "9",
+    "sept": "9",
+    "october": "10",
+    "oct": "10",
+    "november": "11",
+    "nov": "11",
+    "december": "12",
+    "dec": "12",
+}
+
+
 def numeric_tokens(value: str) -> set[str]:
-    return {
-        token.replace(",", "")
-        for token in re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", value or "")
-    }
+    return {token.replace(",", "") for token in _NUMBER_RE.findall(value or "")}
+
+
+def normalize_number(token: str) -> str:
+    """Compare numbers by value, not by how they were typed.
+
+    A percent sign is a unit, not a magnitude: the source carries it in its own
+    `unit` field, so a translation writing -0.14% from actual=-0.14 is correct
+    rather than invented. Trailing zeros are normalised for the same reason.
+    Sign is preserved — flipping one reverses the meaning of the number.
+    """
+    cleaned = token.replace(",", "").rstrip("%").lstrip("+")
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return cleaned
+    normalized = value.normalize()
+    # Decimal normalises 100 to 1E+2; expand it back so the strings compare.
+    return format(normalized, "f")
+
+
+def numeric_values(value: str) -> set[str]:
+    return {normalize_number(token) for token in numeric_tokens(value)}
+
+
+def echoable_numbers(value: str) -> set[str]:
+    """Numbers a faithful translation may contain, given this source text.
+
+    Wider than what the tokeniser sees literally: rendering a month name or a
+    quarter label in Chinese turns Jul into 7月 and Q2 into 第2季度, producing
+    digits the English source never spelled out as digits.
+    """
+    allowed = numeric_values(value)
+    glued = _GLUED_DIGIT_RE.findall(value or "")
+    allowed |= {normalize_number(token) for token in glued}
+    lowered = (value or "").lower()
+    for name, number in _MONTH_NUMBERS.items():
+        if re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", lowered):
+            allowed.add(number)
+    return allowed
 
 
 def load_env(path: Path) -> dict[str, str]:

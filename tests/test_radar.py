@@ -13,18 +13,20 @@ from unittest import mock
 from radar import __version__
 from radar.config import load_config
 from radar.delivery import TelegramDelivery
-from radar.models import AlertEvent, NewsItem, RenderedMessage
+from radar.models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from radar.policy import assess, is_fresh, is_quiet_window
 from radar.render import outbox_manifest, render_p0, render_p1, validate_html
 from radar.service import RadarService, check_health
 from radar.sources import FmpCollector
 from radar.store import RadarStore
-from radar.summarizer import Summary
+from radar.summarizer import LlmSummarizer, Summary
 from radar.util import (
     SGT,
     RedactingFormatter,
     canonicalize_url,
+    echoable_numbers,
     hamming_distance,
+    numeric_values,
     redact_secrets,
     register_secrets,
     simhash64,
@@ -1637,6 +1639,140 @@ class WatchdogTests(unittest.TestCase):
             written = {p.name for p in root.joinpath("state").iterdir()}
         self.assertEqual(written, {"heartbeat.json", "watchdog.json"})
         self.assertFalse(root.joinpath("outbox").exists())
+
+
+class NumberGuardTests(unittest.TestCase):
+    """The guard has to reject invented magnitudes without rejecting translation.
+
+    Every case here is taken from production: between 2026-07-27 and 2026-08-03
+    the guard fired 112 times and passed 0 times, so every alert went out as the
+    untranslated English source line.
+    """
+
+    def test_percent_sign_is_a_unit_not_an_invented_number(self) -> None:
+        # Source carries the unit in its own field, so writing -0.14% from
+        # actual=-0.14 is the correct rendering, not a new number.
+        source = '{"actual": -0.14, "estimate": 0.1, "unit": "%"}'
+        written = "环比-0.14%，低于预期0.1%"
+        self.assertTrue(numeric_values(written).issubset(echoable_numbers(source)))
+
+    def test_minus_sign_survives_a_chinese_character(self) -> None:
+        # The old lookbehind treated CJK as a word character and dropped the
+        # sign, turning -0.14 into 0.14 and reporting it as invented.
+        self.assertEqual(numeric_values("环比-0.14%"), {"-0.14"})
+
+    def test_month_name_may_become_a_digit(self) -> None:
+        # Jul reads as 7月 in Chinese; the digit is a translation, not a claim.
+        self.assertIn("7", echoable_numbers("ID Inflation Rate MoM (Jul)"))
+        self.assertNotIn("7", echoable_numbers("ID Inflation Rate MoM (Aug)"))
+
+    def test_quarter_label_may_become_a_digit(self) -> None:
+        self.assertIn("2", echoable_numbers("Q2 revenue beat"))
+
+    def test_iso_date_does_not_leak_a_negative_month(self) -> None:
+        self.assertNotIn("-8", numeric_values("2026-08-03T12:00:00+08:00"))
+
+    def test_invented_magnitude_is_still_rejected(self) -> None:
+        source = '{"actual": -0.14, "estimate": 0.1, "unit": "%"}'
+        invented = "环比-0.14%，年化-1.7%"
+        self.assertFalse(numeric_values(invented).issubset(echoable_numbers(source)))
+
+    def test_flipped_sign_is_still_rejected(self) -> None:
+        # Deflation reported as inflation is exactly what the guard is for.
+        source = '{"actual": -0.14, "unit": "%"}'
+        self.assertFalse(
+            numeric_values("环比+0.14%").issubset(echoable_numbers(source))
+        )
+
+
+class LlmSummarizerTests(unittest.TestCase):
+    def _event(self, title: str) -> AlertEvent:
+        moment = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+        item = NewsItem(
+            identity="macro-1",
+            title=title,
+            url="https://example.com/macro",
+            source="FMP Economic Calendar",
+            source_id="fmp_macro",
+            source_tier="primary",
+            published_at=moment,
+            fetched_at=moment,
+            actual=-0.14,
+            estimate=0.1,
+            unit="%",
+        )
+        assessment = Assessment(
+            level="P0",
+            category="macro",
+            event_key="macro:test",
+            material_hash="hash",
+            reason="deviation",
+            requires_corroboration=False,
+            region="global",
+            action="watch",
+            entities=(),
+        )
+        return AlertEvent(assessment=assessment, items=[item])
+
+    def _summarizer(self) -> LlmSummarizer:
+        return LlmSummarizer(
+            enabled=True,
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="key",
+            model="model",
+            timeout=5,
+            max_output_tokens=200,
+        )
+
+    def _reply(self, payload: dict[str, str]) -> mock.Mock:
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        content = json.dumps(payload, ensure_ascii=False)
+        response.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return response
+
+    def test_faithful_translation_reaches_the_message(self) -> None:
+        event = self._event("ID Inflation Rate MoM (Jul): actual -0.14, estimate 0.1")
+        payload = {
+            "title": "印尼7月通胀环比转负",
+            "fact": "印尼7月CPI环比-0.14%，低于预期0.1%",
+            "impact": "利率预期与风险资产定价可能快速调整。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post", return_value=self._reply(payload)
+        ):
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.fact, payload["fact"])
+        self.assertEqual(summary.title, payload["title"])
+
+    def test_overlong_title_keeps_the_translated_body(self) -> None:
+        # Losing the whole summary over title length is what shipped English.
+        event = self._event("ID Inflation Rate MoM (Jul): actual -0.14, estimate 0.1")
+        payload = {
+            "title": "印尼七月消费者物价指数环比意外转为负值创下今年新低",
+            "fact": "印尼7月CPI环比-0.14%，低于预期0.1%",
+            "impact": "利率预期与风险资产定价可能快速调整。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post", return_value=self._reply(payload)
+        ):
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.title, "经济数据大幅偏离")
+        self.assertEqual(summary.fact, payload["fact"])
+
+    def test_invented_number_still_falls_back_to_source(self) -> None:
+        event = self._event("ID Inflation Rate MoM (Jul): actual -0.14, estimate 0.1")
+        payload = {
+            "title": "印尼通胀转负",
+            "fact": "印尼7月CPI环比-0.14%，年化降幅达1.7%",
+            "impact": "利率预期可能调整。",
+        }
+        with mock.patch(
+            "radar.summarizer.requests.post", return_value=self._reply(payload)
+        ):
+            summary = self._summarizer().summarize(event)
+        self.assertEqual(summary.title, "经济数据大幅偏离")
+        self.assertIn("ID Inflation Rate MoM", summary.fact)
 
 
 if __name__ == "__main__":

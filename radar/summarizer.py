@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import requests
 
 from .models import AlertEvent
-from .util import numeric_tokens
+from .util import echoable_numbers, numeric_values
 
 LOGGER = logging.getLogger(__name__)
 
@@ -99,6 +99,10 @@ class LlmSummarizer:
             "requirements": {
                 "title": "15个汉字以内，说明事件本身",
                 "fact": "一句，核心事实和已有关键数字",
+                "language": (
+                    "除股票代码外全部用中文，英文指标缩写要译出："
+                    "MoM→环比，YoY→同比，QoQ→季环比，CPI→CPI，GDP→GDP"
+                ),
                 "impact": "一句，只写即时影响方向；不能声称未观察到的市场反应",
                 "output": "严格 JSON: title,fact,impact",
             },
@@ -143,15 +147,24 @@ class LlmSummarizer:
             )
             if not candidate.title or not candidate.fact or not candidate.impact:
                 raise ValueError("empty LLM field")
-            if len(candidate.title) > 20:
-                raise ValueError("LLM title too long")
-            allowed_numbers = numeric_tokens(json.dumps(evidence, ensure_ascii=False))
-            generated_numbers = numeric_tokens(
+            allowed_numbers = echoable_numbers(json.dumps(evidence, ensure_ascii=False))
+            generated_numbers = numeric_values(
                 f"{candidate.title} {candidate.fact} {candidate.impact}"
             )
             if not generated_numbers.issubset(allowed_numbers):
                 invented = sorted(generated_numbers - allowed_numbers)
                 raise ValueError(f"LLM invented numbers: {invented}")
+            if len(candidate.title) > 20:
+                # An overlong title is a formatting miss, not a truthfulness one.
+                # Dropping the whole summary over it used to send the untranslated
+                # English source instead, which is a worse answer than borrowing
+                # the category headline and keeping the translated body.
+                LOGGER.info("llm_title_too_long len=%d", len(candidate.title))
+                return Summary(
+                    title=fallback.title,
+                    fact=candidate.fact,
+                    impact=candidate.impact,
+                )
             return candidate
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("llm_summary_fallback error=%s", exc)
