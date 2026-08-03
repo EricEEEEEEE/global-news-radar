@@ -38,12 +38,14 @@ CATEGORY_SCENES = {
         "a glowing coin under a large magnifying glass held by a robed judge"
     ),
     "macro": "a rooftop weather vane spinning hard while people below look up",
-    "earnings": "a giant ledger bursting open with light in a dark office",
-    "merger_acquisition": (
-        "two large ships being lashed together by dock workers with heavy ropes"
+    "disaster": (
+        "a cracked landscape at dusk with a rescue helicopter sweeping its light"
     ),
-    "financing": "a small sapling watered from an enormous golden watering can",
-    "industry": "a factory skyline where one chimney's smoke suddenly changes shape",
+    "political_crisis": ("a toppled marble column on the steps of a government palace"),
+    "health_emergency": (
+        "a giant microscope casting its glow over a shadowed world map"
+    ),
+    "trending": "a crowd in a town square gathered around a glowing globe",
 }
 DEFAULT_SCENE = "a lighthouse beam sweeping across a dark stormy sea"
 

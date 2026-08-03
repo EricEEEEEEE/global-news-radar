@@ -13,7 +13,13 @@ from . import __version__
 from .comic import ComicArtist
 from .delivery import TelegramDelivery, prune_outbox
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
-from .policy import assess, is_fresh, is_quiet_window, quiet_window_end
+from .policy import (
+    assess,
+    is_fresh,
+    is_quiet_window,
+    quiet_window_end,
+    trending_assessment,
+)
 from .render import render_p0, render_p1
 from .sources import (
     FmpCollector,
@@ -24,6 +30,7 @@ from .sources import (
 )
 from .store import RadarStore, is_infra_event
 from .summarizer import LlmSummarizer
+from .trending import TrendingJudge
 from .util import (
     SGT,
     atomic_write,
@@ -126,6 +133,24 @@ class RadarService:
             or config["llm"]["model"],
             timeout=int(config["llm"]["timeout_seconds"]),
             max_output_tokens=int(config["llm"]["max_output_tokens"]),
+        )
+        trending_config = dict(config.get("trending") or {})
+        self.trending = TrendingJudge(
+            enabled=_env_flag(
+                env,
+                "RADAR_TRENDING_ENABLED",
+                bool(trending_config.get("enabled", False)),
+            ),
+            base_url=env.get("LLM_API_BASE") or env.get("FE_LLM_API_BASE", ""),
+            api_key=env.get("LLM_API_KEY") or env.get("FE_LLM_API_KEY", ""),
+            model=env.get("LLM_MODEL")
+            or env.get("FE_LLM_MODEL")
+            or str(config["llm"]["model"] or ""),
+            timeout=int(trending_config.get("timeout_seconds") or 45),
+            max_per_day=int(trending_config.get("max_per_day") or 3),
+        )
+        self.major_sources = tuple(
+            str(value).lower() for value in config["discovery"]["major_sources"]
         )
         comic_config = dict(config.get("comic") or {})
         self.comic = ComicArtist(
@@ -307,23 +332,13 @@ class RadarService:
             or self._cycle % int(self.config["structured"]["interval_cycles"]) == 0
         )
         if self.fmp_enabled and structured_due:
-            # FMP is the only source of scheduled macro and earnings releases:
-            # losing it is closer to losing an official feed than to losing one
-            # of eleven discovery feeds, so it alerts on the strict threshold.
+            # FMP is the only source of scheduled macro releases: losing it is
+            # closer to losing an official feed than to losing one of eleven
+            # discovery feeds, so it alerts on the strict threshold.
             items.extend(
                 self._source_call(
                     "fmp_macro",
                     lambda: self.fmp.collect_macro(now),
-                    now,
-                    errors,
-                    recoveries,
-                    "primary",
-                )
-            )
-            items.extend(
-                self._source_call(
-                    "fmp_earnings",
-                    lambda: self.fmp.collect_earnings(now),
                     now,
                     errors,
                     recoveries,
@@ -731,10 +746,11 @@ class RadarService:
             return stats
 
         p0_events: list[AlertEvent] = []
+        trend_candidates: list[NewsItem] = []
         new_items = 0
         for item in fresh:
             try:
-                new_items += self._process_item(item, now, p0_events)
+                new_items += self._process_item(item, now, p0_events, trend_candidates)
             except Exception:  # noqa: BLE001
                 # One malformed headline must not abort the cycle: every other
                 # item in this batch has already been marked seen and would be
@@ -760,11 +776,20 @@ class RadarService:
                 )
 
         if not quiet:
+            self._buffer_trending(trend_candidates, now)
             p1_rows = self.store.ready_p1(
                 now,
                 now - timedelta(minutes=int(self.config["p1_window_minutes"])),
             )
-            if len(p1_rows) >= 2:
+            # Batching waits for company, but a lone story must not wait to
+            # death: a single editor pick with nothing to pair with used to
+            # expire unsent.
+            solo_after = float(self.config.get("p1_solo_after_minutes") or 0)
+            due_solo = False
+            if p1_rows and solo_after:
+                oldest = datetime.fromisoformat(str(p1_rows[0]["added_at"]))
+                due_solo = now - oldest >= timedelta(minutes=solo_after)
+            if len(p1_rows) >= 2 or due_solo:
                 entries: list[tuple[AlertEvent, Any]] = []
                 for row in p1_rows:
                     item = NewsItem.from_dict(json.loads(str(row["item_json"])))
@@ -826,15 +851,75 @@ class RadarService:
             # be visible in the heartbeat, not only in the log file: the number
             # guard's 112 unnoticed fallbacks are the lesson here.
             stats["comic"] = self.comic.stats()
+        if self.trending.enabled:
+            stats["trending"] = self.trending.stats()
         self._finish_cycle(stats, now)
         return stats
 
+    def _is_trend_candidate(self, item: NewsItem, now: datetime) -> bool:
+        source = item.source.lower()
+        if not any(major in source for major in self.major_sources):
+            return False
+        return not self._is_near_duplicate(item, now)
+
+    def _buffer_trending(self, candidates: list[NewsItem], now: datetime) -> None:
+        """Offer this cycle's unmatched major-source headlines to the judge.
+
+        The daily cap counts stories accepted into the buffer, and it is the
+        only state the judge has: everything else — cooldown, near-duplicate
+        suppression, batching — is the same machinery every P1 rides.
+        """
+        if not self.trending.enabled or not candidates:
+            return
+        today = now.astimezone(SGT).date().isoformat()
+        buffered_today = (
+            int(self.store.get_meta("trending_count", "0") or "0")
+            if self.store.get_meta("trending_day", "") == today
+            else 0
+        )
+        picks = self.trending.pick(
+            candidates, self.trending.max_per_day - buffered_today
+        )
+        for picked in picks:
+            assessment = trending_assessment(picked)
+            allowed, reason = self.store.topic_decision(
+                event_key=assessment.event_key,
+                material_hash=assessment.material_hash,
+                level=assessment.level,
+                now=now,
+                cooldown_hours=float(self.config["topic_cooldown_hours"]),
+            )
+            if not allowed:
+                LOGGER.info(
+                    "trending_suppressed event=%s reason=%s",
+                    assessment.event_key,
+                    reason,
+                )
+                continue
+            self.store.buffer_p1(
+                event_key=assessment.event_key,
+                item=picked,
+                assessment=assessment.to_dict(),
+                now=now,
+                expires_at=now
+                + timedelta(minutes=int(self.config["p1_expiry_minutes"])),
+            )
+            buffered_today += 1
+        self.store.set_meta("trending_day", today, now)
+        self.store.set_meta("trending_count", str(buffered_today), now)
+
     def _process_item(
-        self, item: NewsItem, now: datetime, p0_events: list[AlertEvent]
+        self,
+        item: NewsItem,
+        now: datetime,
+        p0_events: list[AlertEvent],
+        trend_candidates: list[NewsItem] | None = None,
     ) -> int:
         assessment = assess(item, self.config)
         if assessment is None:
             if not self.store.item_seen(item.identity):
+                if trend_candidates is not None and self._is_trend_candidate(item, now):
+                    trend_candidates.append(item)
                 self._mark_item(item, now)
             return 0
         # Add an observation before near-duplicate suppression so a second

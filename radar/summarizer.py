@@ -25,10 +25,10 @@ CATEGORY_TITLES = {
     "geopolitics": "重大地缘事件",
     "crypto_regulation": "加密监管突发",
     "macro": "经济数据大幅偏离",
-    "earnings": "巨头财报意外",
-    "merger_acquisition": "重大并购动态",
-    "financing": "重大融资动态",
-    "industry": "行业突发动态",
+    "disaster": "重大灾难事件",
+    "political_crisis": "政治局势剧变",
+    "health_emergency": "公共卫生事件",
+    "trending": "全球热点",
 }
 
 CATEGORY_IMPACTS = {
@@ -36,10 +36,10 @@ CATEGORY_IMPACTS = {
     "geopolitics": "避险需求及相关商品波动可能上升。",
     "crypto_regulation": "相关加密资产与平台面临即时监管重估。",
     "macro": "利率预期与风险资产定价可能快速调整。",
-    "earnings": "相关公司及同业盘后定价可能重新调整。",
-    "merger_acquisition": "交易双方及同业估值可能出现即时反应。",
-    "financing": "融资相关公司与行业估值可能重新定价。",
-    "industry": "相关产业链的供需预期可能立即变化。",
+    "disaster": "当地伤亡与基础设施影响待确认。",
+    "political_crisis": "该国局势与地区稳定面临不确定性。",
+    "health_emergency": "传播范围与防控措施值得关注。",
+    "trending": "全球关注度高，值得了解。",
 }
 
 
@@ -93,7 +93,7 @@ class LlmSummarizer:
         ]
         prompt = {
             "task": (
-                "把已确认的金融突发事件压缩成中文 Telegram 速报。"
+                "把已确认的突发新闻压缩成中文 Telegram 速报。"
                 "只翻译和压缩，不判断严重度，不添加数字、因果、预测或交易建议。"
             ),
             "requirements": {

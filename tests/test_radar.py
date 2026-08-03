@@ -16,12 +16,13 @@ from radar.comic import CATEGORY_SCENES, HARD_BANS, ComicArtist
 from radar.config import load_config
 from radar.delivery import TelegramDelivery
 from radar.models import AlertEvent, Assessment, NewsItem, RenderedMessage
-from radar.policy import assess, is_fresh, is_quiet_window
+from radar.policy import assess, is_fresh, is_quiet_window, trending_assessment
 from radar.render import outbox_manifest, render_p0, render_p1, validate_html
 from radar.service import RadarService, check_health
 from radar.sources import FmpCollector
 from radar.store import RadarStore
 from radar.summarizer import LlmSummarizer, Summary
+from radar.trending import TrendingJudge
 from radar.util import (
     SGT,
     RedactingFormatter,
@@ -229,30 +230,94 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
-    def test_mega_cap_earnings_surprise(self) -> None:
-        result = assess(
-            item(
-                "TSLA EPS $0.33 vs $0.53 expected",
-                source="Reuters",
-                source_tier="secondary",
-                symbol="TSLA",
-            ),
-            CONFIG,
-        )
-        self.assertIsNotNone(result)
-        self.assertEqual(result.category, "earnings")
+    def test_company_news_is_rejected(self) -> None:
+        # 公司类整体退役：财报、并购、融资都不再是雷达的事。
+        for title in (
+            "TSLA EPS $0.33 vs $0.53 expected",
+            "Acme agrees to buy Beta in $12 billion deal",
+            "Gamma raises $2 billion in funding round",
+        ):
+            self.assertIsNone(
+                assess(
+                    item(title, source="Reuters", source_tier="secondary"),
+                    CONFIG,
+                ),
+                title,
+            )
 
-    def test_single_merger_is_p1(self) -> None:
-        result = assess(
-            item(
-                "Acme agrees to buy Beta in $12 billion deal",
-                source="Reuters",
-                source_tier="secondary",
-            ),
-            CONFIG,
+    def test_minor_economy_macro_is_rejected(self) -> None:
+        minor = item(
+            "PK Inflation Rate YoY (Jul): actual 9.2, estimate 10.2",
+            source="FMP Economic Calendar",
+            source_tier="structured",
+            category_hint="macro",
+            actual=9.2,
+            estimate=10.2,
         )
+        self.assertIsNone(assess(minor, CONFIG))
+        major = item(
+            "US Inflation Rate YoY (Jul): actual 9.2, estimate 10.2",
+            source="FMP Economic Calendar",
+            source_tier="structured",
+            category_hint="macro",
+            actual=9.2,
+            estimate=10.2,
+        )
+        result = assess(major, CONFIG)
         self.assertIsNotNone(result)
+        self.assertEqual(result.category, "macro")
+
+    def test_minor_economy_headline_macro_is_rejected(self) -> None:
+        self.assertIsNone(
+            assess(
+                item(
+                    "Pakistan CPI rises 9.2% vs 10.2% expected",
+                    source="Reuters",
+                    source_tier="secondary",
+                ),
+                CONFIG,
+            )
+        )
+
+    def test_world_events_are_p0_with_corroboration(self) -> None:
+        cases = {
+            "Magnitude 7.8 earthquake strikes off the coast": "disaster",
+            "Army seizes power in coup, leader detained": "political_crisis",
+            "WHO declares public health emergency over new virus": ("health_emergency"),
+        }
+        for title, category in cases.items():
+            result = assess(
+                item(title, source="BBC", source_tier="secondary"),
+                CONFIG,
+            )
+            self.assertIsNotNone(result, title)
+            self.assertEqual(result.category, category)
+            self.assertEqual(result.level, "P0")
+            self.assertTrue(result.requires_corroboration)
+
+    def test_recoup_is_not_a_coup(self) -> None:
+        self.assertIsNone(
+            assess(
+                item(
+                    "Investors recoup losses as markets stabilise",
+                    source="Reuters",
+                    source_tier="secondary",
+                ),
+                CONFIG,
+            )
+        )
+
+    def test_trending_assessment_shape(self) -> None:
+        picked = item(
+            "Rare comet visible worldwide this weekend",
+            source="BBC",
+            source_tier="secondary",
+        )
+        result = trending_assessment(picked)
         self.assertEqual(result.level, "P1")
+        self.assertEqual(result.category, "trending")
+        self.assertTrue(result.event_key.startswith("trending:"))
+        self.assertFalse(result.requires_corroboration)
 
     def test_stale_and_future_rejected(self) -> None:
         stale = item("Fed cuts rates", minutes_old=76)
@@ -662,32 +727,32 @@ class RenderTests(unittest.TestCase):
 
     def test_p1_requires_two_entries_and_fits(self) -> None:
         one = item(
-            "Acme agrees to buy Beta in $12 billion deal",
+            "Rare comet visible worldwide this weekend",
             identity="m1",
             source="Reuters",
             source_tier="secondary",
             region="us",
         )
         two = item(
-            "Gamma raises $2 billion in funding round",
+            "Lost Rembrandt painting found in attic",
             identity="m2",
             source="Bloomberg",
             source_tier="secondary",
             region="eu",
         )
-        assessment_one = assess(one, CONFIG)
-        assessment_two = assess(two, CONFIG)
+        assessment_one = trending_assessment(one)
+        assessment_two = trending_assessment(two)
         self.assertIsNotNone(assessment_one)
         self.assertIsNotNone(assessment_two)
         message = render_p1(
             [
                 (
                     AlertEvent(assessment_one, [one]),
-                    Summary("并购", one.title, "相关资产可能重新定价。"),
+                    Summary("热点", one.title, "全球关注度高，值得了解。"),
                 ),
                 (
                     AlertEvent(assessment_two, [two]),
-                    Summary("融资", two.title, "相关资产可能重新定价。"),
+                    Summary("热点", two.title, "全球关注度高，值得了解。"),
                 ),
             ],
             NOW,
@@ -707,18 +772,18 @@ class RenderTests(unittest.TestCase):
         entries = []
         for index in range(5):
             current = item(
-                "Acme agrees to buy Beta in $12 billion deal " + "超长事实" * 20,
+                "Rare deep-sea creature filmed alive " + "超长事实" * 20,
                 identity=f"long-{index}",
                 source=f"Source {index}",
                 source_tier="secondary",
                 region="asia",
             )
-            assessment = assess(current, CONFIG)
+            assessment = trending_assessment(current)
             self.assertIsNotNone(assessment)
             entries.append(
                 (
                     AlertEvent(assessment, [current]),
-                    Summary("行业动态", current.title, "相关资产可能重新定价。"),
+                    Summary("热点", current.title, "全球关注度高，值得了解。"),
                 )
             )
         message = render_p1(entries, NOW, 400)
@@ -745,6 +810,24 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(manifest["version"], f"global-news-radar/{__version__}")
         self.assertEqual(manifest["visual_spec"]["selected_modality"], "text")
         self.assertEqual(manifest["visual_spec"]["fallback_chain"], ["text"])
+
+
+class FakeJudge:
+    """Deterministic stand-in for TrendingJudge: picks everything offered."""
+
+    def __init__(self, max_per_day: int = 3):
+        self.enabled = True
+        self.max_per_day = max_per_day
+        self.offered: list[list[NewsItem]] = []
+        self.remaining_seen: list[int] = []
+
+    def pick(self, candidates: list[NewsItem], remaining: int) -> list[NewsItem]:
+        self.offered.append(list(candidates))
+        self.remaining_seen.append(remaining)
+        return list(candidates)[: max(0, min(remaining, 2))]
+
+    def stats(self) -> dict[str, int]:
+        return {"picked": 0, "failed": 0}
 
 
 class FakeDelivery:
@@ -890,28 +973,93 @@ class ServiceIntegrationTests(unittest.TestCase):
     def test_p1_sends_only_after_second_unique_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = self.make_service(directory)
+            service.trending = FakeJudge()
             service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
-            merger = item(
-                "Acme agrees to buy Beta in $12 billion deal",
-                identity="p1-merger",
+            comet = item(
+                "Rare comet visible worldwide this weekend",
+                identity="p1-comet",
                 source="Reuters",
                 source_tier="secondary",
             )
-            financing = item(
-                "Gamma raises $2 billion in funding round",
-                identity="p1-financing",
+            painting = item(
+                "Lost Rembrandt painting found in attic",
+                identity="p1-painting",
                 source="Bloomberg",
                 source_tier="secondary",
                 region="eu",
             )
-            service.collect = lambda now: ([merger], [], [])
+            service.collect = lambda now: ([comet], [], [])
             self.assertEqual(service.run_once(NOW)["sent"], 0)
-            service.collect = lambda now: ([financing], [], [])
+            service.collect = lambda now: ([painting], [], [])
             stats = service.run_once(NOW + timedelta(minutes=2))
             self.assertEqual(stats["sent"], 1)
             message = service.delivery.messages[0][0]
             self.assertEqual(message.level, "P1")
             self.assertEqual(len(message.event_keys), 2)
+            service.close()
+
+    def test_lone_p1_sends_after_solo_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            service.trending = FakeJudge()
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            comet = item(
+                "Rare comet visible worldwide this weekend",
+                identity="solo-comet",
+                source="Reuters",
+                source_tier="secondary",
+            )
+            service.collect = lambda now: ([comet], [], [])
+            self.assertEqual(service.run_once(NOW)["sent"], 0)
+            service.collect = lambda now: ([], [], [])
+            later = NOW + timedelta(minutes=61)
+            stats = service.run_once(later)
+            self.assertEqual(stats["sent"], 1)
+            message = service.delivery.messages[0][0]
+            self.assertEqual(message.level, "P1")
+            self.assertEqual(len(message.event_keys), 1)
+            service.close()
+
+    def test_trending_daily_cap_limits_buffering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            judge = FakeJudge()
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            service.store.set_meta(
+                "trending_day", NOW.astimezone(SGT).date().isoformat(), NOW
+            )
+            service.store.set_meta("trending_count", "3", NOW)
+            comet = item(
+                "Rare comet visible worldwide this weekend",
+                identity="cap-comet",
+                source="Reuters",
+                source_tier="secondary",
+            )
+            service.collect = lambda now: ([comet], [], [])
+            service.run_once(NOW)
+            self.assertEqual(judge.remaining_seen, [0])
+            self.assertEqual(
+                len(service.store.ready_p1(NOW, NOW - timedelta(minutes=120))),
+                0,
+            )
+            service.close()
+
+    def test_non_major_source_not_offered_to_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(directory)
+            judge = FakeJudge()
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            obscure = item(
+                "Rare comet visible worldwide this weekend",
+                identity="obscure-comet",
+                source="Random Blog",
+                source_tier="secondary",
+            )
+            service.collect = lambda now: ([obscure], [], [])
+            service.run_once(NOW)
+            self.assertEqual(judge.offered, [])
             service.close()
 
     def test_quiet_window_queues_then_delivers(self) -> None:
@@ -1883,6 +2031,66 @@ class ComicArtistTests(unittest.TestCase):
         ):
             self.assertIsNone(artist.generate([("macro", "事实")]))
         self.assertEqual(artist.stats(), {"generated": 0, "failed": 1})
+
+
+class TrendingJudgeTests(unittest.TestCase):
+    def _judge(self, **overrides) -> TrendingJudge:
+        settings = {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "key",
+            "model": "judge-model",
+            "timeout": 5,
+            "max_per_day": 3,
+        }
+        settings.update(overrides)
+        return TrendingJudge(**settings)
+
+    def _candidates(self) -> list[NewsItem]:
+        return [
+            item(
+                "Rare comet visible worldwide this weekend",
+                identity="comet-1",
+                source="BBC",
+                source_tier="secondary",
+            ),
+            item(
+                "Lost Rembrandt painting found in attic",
+                identity="painting-1",
+                source="Reuters",
+                source_tier="secondary",
+            ),
+        ]
+
+    def _reply(self, picks: list[str]) -> mock.Mock:
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        content = json.dumps({"picks": picks}, ensure_ascii=False)
+        response.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return response
+
+    def test_valid_pick_honored_invented_id_dropped(self) -> None:
+        judge = self._judge()
+        reply = self._reply(["comet-1", "made-up-id"])
+        with mock.patch("radar.trending.requests.post", return_value=reply):
+            picks = judge.pick(self._candidates(), 3)
+        self.assertEqual([picked.identity for picked in picks], ["comet-1"])
+        self.assertEqual(judge.stats()["picked"], 1)
+
+    def test_disabled_or_exhausted_makes_no_calls(self) -> None:
+        with mock.patch("radar.trending.requests.post") as post:
+            self.assertEqual(self._judge(enabled=False).pick(self._candidates(), 3), [])
+            self.assertEqual(self._judge().pick(self._candidates(), 0), [])
+            self.assertEqual(self._judge().pick([], 3), [])
+        post.assert_not_called()
+
+    def test_judge_failure_counts_and_returns_nothing(self) -> None:
+        judge = self._judge()
+        with mock.patch(
+            "radar.trending.requests.post", side_effect=RuntimeError("down")
+        ):
+            self.assertEqual(judge.pick(self._candidates(), 3), [])
+        self.assertEqual(judge.stats()["failed"], 1)
 
 
 class PhotoDeliveryTests(unittest.TestCase):

@@ -164,7 +164,7 @@ def discovery_queries(now_sgt: datetime) -> list[tuple[str, str]]:
             ("europe", "ECB Europe energy geopolitical breaking news when:1h")
         )
     else:
-        queries.append(("us", "Fed Treasury earnings US market breaking news when:1h"))
+        queries.append(("us", "Fed Treasury US market breaking news when:1h"))
     return queries
 
 
@@ -316,47 +316,6 @@ class FmpCollector:
                     actual=actual,
                     estimate=estimate,
                     unit=unit,
-                    raw=row,
-                )
-            )
-        return result
-
-    def collect_earnings(self, now: datetime) -> list[NewsItem]:
-        if not self.api_key:
-            return []
-        symbols = set(self.config["mega_cap_symbols"])
-        result: list[NewsItem] = []
-        for row in self._get("earnings-calendar", now):
-            symbol = str(row.get("symbol") or "").upper()
-            if symbol not in symbols:
-                continue
-            actual = _float(row.get("epsActual") or row.get("actual"))
-            estimate = _float(row.get("epsEstimated") or row.get("estimate"))
-            raw_date = row.get("date")
-            if not _has_clock(raw_date):
-                continue
-            published = parse_datetime(str(raw_date or ""))
-            if actual is None or estimate in {None, 0} or published is None:
-                continue
-            raw_identity = (
-                f"earnings|{symbol}|{published.isoformat()}|{actual}|{estimate}"
-            )
-            result.append(
-                NewsItem(
-                    identity=stable_hash(raw_identity, 24),
-                    title=f"{symbol} EPS actual {actual:g}, estimate {estimate:g}",
-                    url="https://site.financialmodelingprep.com/developer/docs/stable/earnings-calendar",
-                    source="FMP Earnings Calendar",
-                    source_id="fmp_earnings",
-                    source_tier="structured",
-                    published_at=published,
-                    fetched_at=now,
-                    region="us",
-                    category_hint="earnings",
-                    actual=actual,
-                    estimate=estimate,
-                    unit="EPS",
-                    symbol=symbol,
                     raw=row,
                 )
             )

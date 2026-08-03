@@ -180,6 +180,83 @@ GEOPOLITICAL_ACTIONS = (
     "制裁",
 )
 
+# World-event vocabularies. All of these arrive from discovery feeds, so the
+# existing rule "secondary-source P0 needs two major outlets" is the noise
+# gate; the keywords only have to be unambiguous, not exhaustive.
+DISASTER_TERMS = (
+    "earthquake",
+    "tsunami",
+    "plane crash",
+    "air crash",
+    "jet crashes",
+    "volcano erupt",
+    "dam collapse",
+    "bridge collapse",
+    "train derail",
+    "flash flood",
+    "hurricane makes landfall",
+    "typhoon makes landfall",
+    "地震",
+    "海啸",
+    "坠机",
+    "空难",
+    "火山喷发",
+    "溃坝",
+    "脱轨",
+)
+
+POLITICAL_CRISIS_TERMS = (
+    # Leading space so "recoup" cannot read as a coup.
+    " coup",
+    "martial law",
+    "assassinat",
+    "impeach",
+    "state of emergency",
+    "president dies",
+    "president dead",
+    "president resigns",
+    "prime minister resigns",
+    "政变",
+    "戒严",
+    "遇刺",
+    "弹劾",
+    "紧急状态",
+    "总统去世",
+    "首相去世",
+)
+
+HEALTH_EMERGENCY_TERMS = (
+    "pandemic",
+    "public health emergency",
+    "who declares",
+    "epidemic",
+    "disease outbreak",
+    "outbreak spreads",
+    "大流行",
+    "疫情爆发",
+    "公共卫生紧急",
+)
+
+# 宏观数据只保留五大经济体：美、中、欧元区、日、英。FMP rows carry an ISO
+# country code; headline items match padded aliases so "thus" is not the US.
+MAJOR_ECONOMY_CODES = {"US", "CN", "EU", "EA", "JP", "GB", "UK"}
+MAJOR_ECONOMY_TERMS = (
+    " united states",
+    " u.s.",
+    " us ",
+    " america",
+    " china",
+    " chinese",
+    " euro zone",
+    " eurozone",
+    " euro area",
+    " japan",
+    " united kingdom",
+    " britain",
+    " british",
+    " uk ",
+)
+
 REGULATORY_ACTIONS = (
     "charges ",
     "sues ",
@@ -212,50 +289,15 @@ CRYPTO_TERMS = (
     "稳定币",
 )
 
-P1_ACTIONS = {
-    "merger_acquisition": (
-        "acquires ",
-        "to acquire",
-        "agrees to buy",
-        "merger agreement",
-        "takeover bid",
-        "收购",
-        "并购",
-        "合并协议",
-    ),
-    "financing": (
-        "raises $",
-        "funding round",
-        "series a",
-        "series b",
-        "series c",
-        "debt financing",
-        "融资",
-        "募资",
-    ),
-    "industry": (
-        "factory shutdown",
-        "supply disruption",
-        "export restriction",
-        "recall ",
-        "data breach",
-        "production halt",
-        "供应中断",
-        "出口限制",
-        "数据泄露",
-        "停产",
-    ),
-}
-
 ACTION_LABELS = {
     "central_bank": "policy_decision",
     "geopolitics": "conflict_or_sanctions",
     "crypto_regulation": "regulatory_action",
     "macro": "data_release",
-    "earnings": "earnings_release",
-    "merger_acquisition": "corporate_transaction",
-    "financing": "financing",
-    "industry": "industry_disruption",
+    "disaster": "major_disaster",
+    "political_crisis": "political_upheaval",
+    "health_emergency": "health_emergency",
+    "trending": "editor_pick",
 }
 
 
@@ -417,6 +459,13 @@ def _material_hash(item: NewsItem, category: str, scope: str) -> str:
     return stable_hash("|".join(values), 20)
 
 
+def _is_major_economy(item: NewsItem, text: str) -> bool:
+    code = str(item.raw.get("country") or "").strip().upper()
+    if code:
+        return code in MAJOR_ECONOMY_CODES
+    return _contains_any(text, MAJOR_ECONOMY_TERMS)
+
+
 def _structured_assessment(
     item: NewsItem, config: dict[str, Any]
 ) -> tuple[str, str, str] | None:
@@ -425,6 +474,10 @@ def _structured_assessment(
         and item.actual is not None
         and item.estimate is not None
     ):
+        # A 0.2pp CPI miss in Pakistan is a fact, not news the operator can
+        # use. Only the economies that price the world get through.
+        if not _is_major_economy(item, f" {item.title.lower()} "):
+            return None
         title = item.title.lower()
         if "payroll" in title:
             denominator = abs(item.estimate) or 1.0
@@ -435,11 +488,6 @@ def _structured_assessment(
             surprise = abs(item.actual - item.estimate)
             if surprise >= float(config["structured"]["rate_surprise_pp"]):
                 return "P0", "macro", f"absolute surprise {surprise:g}pp"
-        return None
-    if item.category_hint == "earnings" and item.actual is not None and item.estimate:
-        surprise = abs(item.actual - item.estimate) / abs(item.estimate)
-        if surprise >= float(config["structured"]["earnings_surprise_ratio"]):
-            return "P0", "earnings", f"EPS surprise {surprise:.1%}"
         return None
     return None
 
@@ -461,6 +509,8 @@ def _headline_surprise(
         text,
     )
     if (rate_event or count_event) and actual_expected:
+        if not _is_major_economy(item, text):
+            return None
         actual = float(actual_expected.group(1).replace(",", ""))
         expected = float(actual_expected.group(3).replace(",", ""))
         if rate_event and abs(actual - expected) >= float(
@@ -473,26 +523,30 @@ def _headline_surprise(
         ):
             item.actual, item.estimate = actual, expected
             return "P0", "macro", "headline count surprise"
-
-    mega_caps = {symbol.lower() for symbol in config["structured"]["mega_cap_symbols"]}
-    entity_values = {value.lower() for value in _entities(text, item.symbol)}
-    if mega_caps.intersection(entity_values) and (
-        "eps" in text or "earnings per share" in text
-    ):
-        match = re.search(
-            r"(?:eps|earnings per share).{0,20}?([+-]?\$?\d+(?:\.\d+)?)"
-            r".{0,35}?(?:vs\.?|versus|expected|estimate)"
-            r".{0,20}?([+-]?\$?\d+(?:\.\d+)?)",
-            text,
-        )
-        if match:
-            actual = float(match.group(1).replace("$", ""))
-            estimate = float(match.group(2).replace("$", ""))
-            surprise = abs(actual - estimate) / (abs(estimate) or 1.0)
-            if surprise >= float(config["structured"]["earnings_surprise_ratio"]):
-                item.actual, item.estimate = actual, estimate
-                return "P0", "earnings", f"headline EPS surprise {surprise:.1%}"
     return None
+
+
+def trending_assessment(item: NewsItem) -> Assessment:
+    """Assessment for an editor-picked story. P1: batched, never urgent."""
+    scope = _key_scope((), item.title)
+    action = ACTION_LABELS["trending"]
+    return Assessment(
+        level="P1",
+        category="trending",
+        event_key=_event_key(
+            category="trending",
+            action=action,
+            scope=scope,
+            occurred_at=item.published_at,
+        ),
+        material_hash=_material_hash(item, "trending", scope),
+        reason="editor pick",
+        requires_corroboration=False,
+        region=item.region,
+        action=action,
+        entities=_display_entities(f" {item.title} ", item.symbol),
+        topic_anchor=_topic_anchor("trending", action, scope),
+    )
 
 
 def assess(item: NewsItem, config: dict[str, Any]) -> Assessment | None:
@@ -522,11 +576,12 @@ def assess(item: NewsItem, config: dict[str, Any]) -> Assessment | None:
         level, category, reason = "P0", "geopolitics", "major conflict or sanctions"
     elif _contains_any(text, REGULATORY_ACTIONS) and _contains_any(text, CRYPTO_TERMS):
         level, category, reason = "P0", "crypto_regulation", "major crypto regulation"
-    else:
-        for candidate, terms in P1_ACTIONS.items():
-            if _contains_any(text, terms):
-                level, category, reason = "P1", candidate, f"matched {candidate}"
-                break
+    elif _contains_any(text, DISASTER_TERMS):
+        level, category, reason = "P0", "disaster", "major disaster"
+    elif _contains_any(text, POLITICAL_CRISIS_TERMS):
+        level, category, reason = "P0", "political_crisis", "political upheaval"
+    elif _contains_any(text, HEALTH_EMERGENCY_TERMS):
+        level, category, reason = "P0", "health_emergency", "health emergency"
     if not level:
         return None
 
