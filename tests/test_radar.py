@@ -2039,6 +2039,25 @@ class BareEnglishSpanTests(unittest.TestCase):
             [],
         )
 
+    def test_gloss_once_covers_bare_repeats(self) -> None:
+        # 中文媒体惯例：首次注释，后文裸用。逐次要求括号会误伤正确译文。
+        text = (
+            "Curium拟收购Lantheus\n"
+            "Curium（居里）将收购Lantheus（放射药企）\n"
+            "Lantheus股价可能上涨"
+        )
+        self.assertEqual(bare_english_spans(text), [])
+
+    def test_newline_join_keeps_fields_apart(self) -> None:
+        # 标题结尾和正文开头各有一个名字：换行拼接下它们是两个独立词组，
+        # 各自凭全文注释豁免；空格拼接会把它们粘成一个幻影词组。
+        self.assertEqual(
+            bare_english_spans(
+                "收购Lantheus\nCurium（居里）完成\nLantheus（放射药企）"
+            ),
+            [],
+        )
+
 
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"x" * 2000
 

@@ -50,21 +50,30 @@ _BARE_ENGLISH_RE = re.compile(r"[A-Za-z][A-Za-z0-9 .&'’-]{3,}")
 
 
 def bare_english_spans(text: str) -> list[str]:
-    """English name-runs that lack a Chinese gloss right behind them.
+    """English names that are never glossed with Chinese anywhere in the text.
 
-    "Visa（维萨）" is fine; "Clearmind Medicine将收购…" is what the operator
-    flagged: a bare English company name in an otherwise Chinese sentence.
+    "Visa（维萨）" is fine; "Clearmind Medicine将收购…" with no gloss in the
+    whole message is what the operator flagged. Chinese newsroom convention
+    glosses a name once and uses it bare afterwards, so the unit is the name,
+    not the occurrence. Callers joining fields must join with a newline: a
+    space would fuse "…Lantheus" + "Curium…" into one phantom ASCII run.
     """
-    spans: list[str] = []
+    glossed: set[str] = set()
+    seen: list[str] = []
     for match in _BARE_ENGLISH_RE.finditer(text or ""):
         span = match.group(0).strip(" .&'’-")
         if not re.search(r"[a-z]", span):
             continue
         tail = text[match.end() :].lstrip()
         if tail.startswith("（") or tail.startswith("("):
-            continue
-        spans.append(span)
-    return spans
+            glossed.add(span)
+        else:
+            seen.append(span)
+    return [
+        span
+        for span in seen
+        if not any(span in name or name in span for name in glossed)
+    ]
 
 
 def deterministic_summary(event: AlertEvent) -> Summary:
@@ -120,7 +129,11 @@ class LlmSummarizer:
                     "例如 Visa（维萨）、Lantheus（美国放射性药物公司）；"
                     "不允许出现没有中文注释的英文词组。"
                 ),
-                "impact": "一句，只写即时影响方向；不能声称未观察到的市场反应",
+                "impact": (
+                    "一句，用「可能」表述即时影响方向；"
+                    "禁止声称已发生的市场反应（如 股价上涨/大涨），"
+                    "除非原文明确报道了该反应"
+                ),
                 "output": "严格 JSON: title,fact,impact",
             },
             "category": event.assessment.category,
@@ -221,7 +234,7 @@ class LlmSummarizer:
                 LOGGER.warning("llm_summary_retry reason=invented_numbers %s", invented)
                 continue
             spans = bare_english_spans(
-                f"{candidate.title} {candidate.fact} {candidate.impact}"
+                "\n".join((candidate.title, candidate.fact, candidate.impact))
             )
             if spans:
                 # Formatting miss, not a truthfulness one: keep the draft as a
