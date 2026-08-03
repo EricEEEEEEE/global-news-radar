@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .comic import ComicArtist
 from .delivery import TelegramDelivery
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from .policy import assess, is_fresh, is_quiet_window, quiet_window_end
@@ -125,6 +126,20 @@ class RadarService:
             or config["llm"]["model"],
             timeout=int(config["llm"]["timeout_seconds"]),
             max_output_tokens=int(config["llm"]["max_output_tokens"]),
+        )
+        comic_config = dict(config.get("comic") or {})
+        self.comic = ComicArtist(
+            enabled=_env_flag(
+                env, "RADAR_COMIC_ENABLED", bool(comic_config.get("enabled", False))
+            ),
+            base_url=env.get("LLM_API_BASE") or env.get("FE_LLM_API_BASE", ""),
+            api_key=env.get("LLM_API_KEY") or env.get("FE_LLM_API_KEY", ""),
+            scene_model=env.get("LLM_MODEL")
+            or env.get("FE_LLM_MODEL")
+            or str(config["llm"]["model"] or ""),
+            image_model=str(comic_config.get("image_model") or "grok-imagine-image"),
+            scene_timeout=int(comic_config.get("scene_timeout_seconds") or 45),
+            image_timeout=int(comic_config.get("image_timeout_seconds") or 150),
         )
         self.delivery = TelegramDelivery(
             token=env.get("TELEGRAM_BOT_TOKEN", ""),
@@ -445,7 +460,11 @@ class RadarService:
         self.store.export_deliveries(self.root / "state" / "radar_events.jsonl")
 
     def _deliver_or_queue(
-        self, message: RenderedMessage, thread_id: str, now: datetime
+        self,
+        message: RenderedMessage,
+        thread_id: str,
+        now: datetime,
+        photo: bytes | None = None,
     ) -> bool:
         if self.store.delivery_exists(message.content_hash):
             LOGGER.info(
@@ -453,7 +472,7 @@ class RadarService:
             )
             return True
         try:
-            result = self.delivery.send(message, thread_id)
+            result = self.delivery.send(message, thread_id, photo=photo)
             self._record_success(message, result, now)
             LOGGER.info(
                 "delivery_ok level=%s message_id=%s dry_run=%s",
@@ -759,7 +778,10 @@ class RadarService:
                     now,
                     int(self.config["telegram"]["max_visible_chars"]),
                 )
-                if self._deliver_or_queue(message, self.news_thread_id, now):
+                photo = self.comic.for_digest(entries)
+                if self._deliver_or_queue(
+                    message, self.news_thread_id, now, photo=photo
+                ):
                     sent += 1
 
         self._source_recovery_alerts(recoveries, now)
@@ -794,6 +816,11 @@ class RadarService:
             "pending_deliveries": pending_count,
             "deadletter_deliveries": deadletter_count,
         }
+        if self.comic.enabled:
+            # Cumulative since process start. A silent generator failure must
+            # be visible in the heartbeat, not only in the log file: the number
+            # guard's 112 unnoticed fallbacks are the lesson here.
+            stats["comic"] = self.comic.stats()
         self._finish_cycle(stats, now)
         return stats
 
@@ -866,6 +893,8 @@ class RadarService:
             int(self.config["telegram"]["max_visible_chars"]),
         )
         if quiet:
+            # The quiet queue serialises the message as JSON and re-sends it as
+            # text after the window; generating an image now would be wasted.
             quiet_end = quiet_window_end(now, str(self.config["quiet_window"]["end"]))
             self.store.queue_delivery(
                 message,
@@ -874,7 +903,8 @@ class RadarService:
                 error="quiet_window",
             )
             return 0
-        if self._deliver_or_queue(message, self.news_thread_id, now):
+        photo = self.comic.for_event(event, summary)
+        if self._deliver_or_queue(message, self.news_thread_id, now, photo=photo):
             return 1
         return 0
 

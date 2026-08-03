@@ -245,5 +245,12 @@ def atomic_write(path: Path, content: str) -> None:
     os.replace(temporary, path)
 
 
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
+
+
 def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

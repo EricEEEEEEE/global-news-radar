@@ -1,4 +1,4 @@
-version: "1.4.0"
+version: "1.5.0"
 timezone: Asia/Singapore
 poll_seconds: 120
 freshness_minutes: 75
@@ -51,6 +51,14 @@ llm:
   model: ""
   timeout_seconds: 35
   max_output_tokens: 400
+# Comic rendering for alerts: the picture carries mood and domain only, every
+# fact stays in the caption text. Generation failure falls back to plain text
+# and is counted in cycle stats. Ships disabled, like every optional call.
+comic:
+  enabled: false
+  image_model: grok-imagine-image
+  scene_timeout_seconds: 45
+  image_timeout_seconds: 150
 official_feeds:
   - id: fed_all
     name: Federal Reserve

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from radar import __version__
+from radar.comic import CATEGORY_SCENES, HARD_BANS, ComicArtist
 from radar.config import load_config
 from radar.delivery import TelegramDelivery
 from radar.models import AlertEvent, Assessment, NewsItem, RenderedMessage
@@ -752,8 +754,10 @@ class FakeDelivery:
         self.messages = []
         self.send_enabled = not dry_run
 
-    def send(self, message, thread_id):
+    def send(self, message, thread_id, photo=None):
         self.messages.append((message, thread_id))
+        self.photos = getattr(self, "photos", [])
+        self.photos.append(photo)
         if self.fail:
             raise RuntimeError("simulated Telegram failure")
         return {
@@ -1773,6 +1777,263 @@ class LlmSummarizerTests(unittest.TestCase):
             summary = self._summarizer().summarize(event)
         self.assertEqual(summary.title, "经济数据大幅偏离")
         self.assertIn("ID Inflation Rate MoM", summary.fact)
+
+
+FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"x" * 2000
+
+
+class ComicArtistTests(unittest.TestCase):
+    def _artist(self, **overrides) -> ComicArtist:
+        settings = {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "key",
+            "scene_model": "scene-model",
+            "image_model": "grok-imagine-image",
+            "scene_timeout": 5,
+            "image_timeout": 5,
+        }
+        settings.update(overrides)
+        return ComicArtist(**settings)
+
+    def _scene_reply(self, scenes: list[str]) -> mock.Mock:
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        content = json.dumps({"scenes": scenes}, ensure_ascii=False)
+        response.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return response
+
+    def _image_reply(self, photo: bytes) -> mock.Mock:
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [{"b64_json": base64.b64encode(photo).decode("ascii")}]
+        }
+        return response
+
+    def test_disabled_artist_makes_no_calls(self) -> None:
+        self.assertFalse(self._artist(api_key="").enabled)
+        artist = self._artist(enabled=False)
+        with mock.patch("radar.comic.requests.post") as post:
+            self.assertIsNone(artist.generate([("macro", "事实")]))
+        post.assert_not_called()
+
+    def test_generated_bytes_decoded_and_counted(self) -> None:
+        artist = self._artist(scene_model="")
+        with mock.patch(
+            "radar.comic.requests.post", return_value=self._image_reply(FAKE_JPEG)
+        ) as post:
+            photo = artist.generate([("macro", "事实")])
+        self.assertEqual(photo, FAKE_JPEG)
+        self.assertEqual(artist.stats(), {"generated": 1, "failed": 0})
+        prompt = post.call_args.kwargs["json"]["prompt"]
+        self.assertIn("single-panel", prompt)
+        self.assertIn(HARD_BANS, prompt)
+        self.assertIn(CATEGORY_SCENES["macro"], prompt)
+
+    def test_scene_with_digits_replaced_by_category_fallback(self) -> None:
+        # The scene text lands on the image model's canvas: a number that
+        # sneaks in becomes a drawn "fact" no gate ever checked.
+        artist = self._artist()
+        replies = [
+            self._scene_reply(["a chart rising 5 percent over a city"]),
+            self._image_reply(FAKE_JPEG),
+        ]
+        with mock.patch("radar.comic.requests.post", side_effect=replies) as post:
+            photo = artist.generate([("macro", "CPI 环比 -0.14%")])
+        self.assertEqual(photo, FAKE_JPEG)
+        prompt = post.call_args_list[1].kwargs["json"]["prompt"]
+        self.assertNotIn("5 percent", prompt)
+        self.assertIn(CATEGORY_SCENES["macro"], prompt)
+
+    def test_scene_failure_uses_deterministic_scenes(self) -> None:
+        artist = self._artist()
+        replies = [RuntimeError("scene model down"), self._image_reply(FAKE_JPEG)]
+        with mock.patch("radar.comic.requests.post", side_effect=replies) as post:
+            photo = artist.generate([("central_bank", "美联储发布决议")])
+        self.assertEqual(photo, FAKE_JPEG)
+        prompt = post.call_args_list[1].kwargs["json"]["prompt"]
+        self.assertIn(CATEGORY_SCENES["central_bank"], prompt)
+
+    def test_four_entries_build_four_panel_prompt(self) -> None:
+        artist = self._artist(scene_model="")
+        entries = [
+            ("macro", "一"),
+            ("central_bank", "二"),
+            ("geopolitics", "三"),
+            ("industry", "四"),
+            ("earnings", "五"),
+        ]
+        with mock.patch(
+            "radar.comic.requests.post", return_value=self._image_reply(FAKE_JPEG)
+        ) as post:
+            photo = artist.generate(entries)
+        self.assertEqual(photo, FAKE_JPEG)
+        prompt = post.call_args.kwargs["json"]["prompt"]
+        # The fifth entry is dropped: one image holds at most four panels.
+        self.assertIn("4-panel", prompt)
+        self.assertIn("Panel 4:", prompt)
+        self.assertNotIn("Panel 5:", prompt)
+        self.assertIn(HARD_BANS, prompt)
+
+    def test_image_failure_returns_none_and_counts(self) -> None:
+        artist = self._artist(scene_model="")
+        with mock.patch(
+            "radar.comic.requests.post", side_effect=RuntimeError("image API down")
+        ):
+            self.assertIsNone(artist.generate([("macro", "事实")]))
+        self.assertEqual(artist.stats(), {"generated": 0, "failed": 1})
+
+
+class PhotoDeliveryTests(unittest.TestCase):
+    def _message(self) -> RenderedMessage:
+        event = RenderTests()._event(
+            "photo-fed",
+            "Federal Reserve issues FOMC statement",
+        )
+        return render_p0(
+            event,
+            Summary("美联储发布决议", "美联储公布最新决定。", "利率预期可能调整。"),
+            NOW,
+            400,
+        )
+
+    def _accepted(self, message_id: int) -> mock.Mock:
+        response = mock.Mock(ok=True, status_code=200, text="ok")
+        response.json.return_value = {
+            "ok": True,
+            "result": {"message_id": message_id},
+        }
+        return response
+
+    def test_photo_send_uses_multipart_and_records_modality(self) -> None:
+        message = self._message()
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = TelegramDelivery(
+                token="test-token",
+                chat_id="-1001",
+                outbox_dir=Path(directory),
+                max_visible_chars=400,
+                send_enabled=True,
+            )
+            with mock.patch(
+                "radar.delivery.requests.post", return_value=self._accepted(9100)
+            ) as post:
+                result = delivery.send(message, "412", photo=FAKE_JPEG)
+            self.assertTrue(post.call_args.args[0].endswith("/sendPhoto"))
+            data = post.call_args.kwargs["data"]
+            files = post.call_args.kwargs["files"]
+            manifest = json.loads(Path(directory, "latest.json").read_text())
+            jpg = Path(directory, "latest.jpg").read_bytes()
+        self.assertEqual(result["modality"], "photo")
+        self.assertEqual(result["message_id"], "9100")
+        self.assertEqual(data["caption"], message.html)
+        self.assertEqual(data["parse_mode"], "HTML")
+        self.assertEqual(data["message_thread_id"], 412)
+        self.assertEqual(files["photo"][1], FAKE_JPEG)
+        self.assertEqual(manifest["modality"], "photo")
+        self.assertEqual(manifest["delivery"]["status"], "sent_photo")
+        self.assertEqual(jpg, FAKE_JPEG)
+
+    def test_photo_failure_falls_back_to_text_message(self) -> None:
+        message = self._message()
+        broken = mock.Mock(ok=False, status_code=500, text="err")
+        broken.json.return_value = {"ok": False, "description": "Internal error"}
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = TelegramDelivery(
+                token="test-token",
+                chat_id="-1001",
+                outbox_dir=Path(directory),
+                max_visible_chars=400,
+                send_enabled=True,
+            )
+            with mock.patch(
+                "radar.delivery.requests.post",
+                side_effect=[broken, self._accepted(9101)],
+            ) as post:
+                result = delivery.send(message, "412", photo=FAKE_JPEG)
+            self.assertTrue(post.call_args_list[1].args[0].endswith("/sendMessage"))
+            manifest = json.loads(Path(directory, "latest.json").read_text())
+        self.assertNotIn("modality", result)
+        self.assertEqual(result["message_id"], "9101")
+        self.assertEqual(manifest["modality"], "text")
+        self.assertEqual(manifest["delivery"]["status"], "sent")
+
+    def test_dry_run_with_photo_writes_jpg_without_network(self) -> None:
+        message = self._message()
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = TelegramDelivery(
+                token="test-token",
+                chat_id="-1001",
+                outbox_dir=Path(directory),
+                max_visible_chars=400,
+                send_enabled=False,
+            )
+            with mock.patch("radar.delivery.requests.post") as post:
+                result = delivery.send(message, "412", photo=FAKE_JPEG)
+            post.assert_not_called()
+            jpg = Path(directory, "latest.jpg").read_bytes()
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(jpg, FAKE_JPEG)
+
+    def test_caption_over_limit_drops_photo(self) -> None:
+        long_text = "字" * 1100
+        message = RenderedMessage(
+            level="P0",
+            html=long_text,
+            plain_text=long_text,
+            event_keys=["over-limit"],
+            content_hash="deadbeefdeadbeef",
+            evidence=[],
+            created_at=NOW,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = TelegramDelivery(
+                token="test-token",
+                chat_id="-1001",
+                outbox_dir=Path(directory),
+                max_visible_chars=2000,
+                send_enabled=True,
+            )
+            with mock.patch(
+                "radar.delivery.requests.post", return_value=self._accepted(9102)
+            ) as post:
+                delivery.send(message, "412", photo=FAKE_JPEG)
+            self.assertEqual(len(post.call_args_list), 1)
+            self.assertTrue(post.call_args.args[0].endswith("/sendMessage"))
+            self.assertFalse(Path(directory, "latest.jpg").exists())
+
+
+class ComicWiringTests(unittest.TestCase):
+    def test_p0_publish_passes_comic_to_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.comic = mock.Mock(
+                for_event=mock.Mock(return_value=FAKE_JPEG), enabled=True
+            )
+            event = RenderTests()._event(
+                "wiring-fed",
+                "Federal Reserve issues FOMC statement",
+            )
+            sent = service._publish_p0(event, NOW, quiet=False)
+            self.assertEqual(sent, 1)
+            self.assertEqual(service.delivery.photos, [FAKE_JPEG])
+            service.close()
+
+    def test_quiet_window_queues_text_without_generating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.comic = mock.Mock(
+                for_event=mock.Mock(return_value=FAKE_JPEG), enabled=True
+            )
+            event = RenderTests()._event(
+                "quiet-fed",
+                "Federal Reserve issues FOMC statement",
+            )
+            sent = service._publish_p0(event, NOW, quiet=True)
+            self.assertEqual(sent, 0)
+            service.comic.for_event.assert_not_called()
+            service.close()
 
 
 if __name__ == "__main__":

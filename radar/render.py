@@ -398,11 +398,15 @@ def render_p1(
     )
 
 
-def outbox_manifest(message: RenderedMessage, delivery: dict[str, object]) -> str:
+def outbox_manifest(
+    message: RenderedMessage,
+    delivery: dict[str, object],
+    modality: str = "text",
+) -> str:
     return json_dumps(
         {
             "schema_version": "1.0",
-            "modality": "text",
+            "modality": modality,
             "level": message.level,
             "headline": message.plain_text.splitlines()[0],
             "event_keys": message.event_keys,
