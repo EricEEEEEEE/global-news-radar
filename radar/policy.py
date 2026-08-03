@@ -460,9 +460,11 @@ def _material_hash(item: NewsItem, category: str, scope: str) -> str:
 
 
 def _is_major_economy(item: NewsItem, text: str) -> bool:
-    code = str(item.raw.get("country") or "").strip().upper()
-    if code:
-        return code in MAJOR_ECONOMY_CODES
+    # A recognised ISO code decides immediately; anything else — including a
+    # provider that starts sending full country names — falls through to the
+    # alias check on the text, which always carries the country string.
+    if str(item.raw.get("country") or "").strip().upper() in MAJOR_ECONOMY_CODES:
+        return True
     return _contains_any(text, MAJOR_ECONOMY_TERMS)
 
 
