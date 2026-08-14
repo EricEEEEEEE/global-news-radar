@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from radar import __version__
+from radar.briefs import BriefComposer
+from radar.clusters import ClusterEngine, tokenize
 from radar.comic import CATEGORY_SCENES, HARD_BANS, ComicArtist
 from radar.config import load_config
 from radar.delivery import TelegramDelivery
@@ -19,7 +21,7 @@ from radar.models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from radar.policy import assess, is_fresh, is_quiet_window, trending_assessment
 from radar.render import outbox_manifest, render_p0, render_p1, validate_html
 from radar.service import RadarService, check_health
-from radar.sources import FmpCollector
+from radar.sources import FmpCollector, GdeltCollector, discovery_queries
 from radar.store import RadarStore
 from radar.summarizer import LlmSummarizer, Summary, bare_english_spans
 from radar.trending import TrendingJudge
@@ -815,16 +817,31 @@ class RenderTests(unittest.TestCase):
 class FakeJudge:
     """Deterministic stand-in for TrendingJudge: picks everything offered."""
 
-    def __init__(self, max_per_day: int = 3):
+    def __init__(
+        self,
+        max_per_day: int = 3,
+        *,
+        picks: bool = True,
+        burst_verdict: bool | None = True,
+    ):
         self.enabled = True
         self.max_per_day = max_per_day
+        self.picks = picks
+        self.burst_verdict = burst_verdict
         self.offered: list[list[NewsItem]] = []
         self.remaining_seen: list[int] = []
+        self.burst_calls: list[list[tuple[str, str]]] = []
 
     def pick(self, candidates: list[NewsItem], remaining: int) -> list[NewsItem]:
         self.offered.append(list(candidates))
         self.remaining_seen.append(remaining)
+        if not self.picks:
+            return []
         return list(candidates)[: max(0, min(remaining, 2))]
+
+    def judge_burst(self, headlines: list[tuple[str, str]]) -> bool | None:
+        self.burst_calls.append(list(headlines))
+        return self.burst_verdict
 
     def stats(self) -> dict[str, int]:
         return {"picked": 0, "failed": 0}
@@ -973,7 +990,9 @@ class ServiceIntegrationTests(unittest.TestCase):
     def test_p1_sends_only_after_second_unique_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = self.make_service(directory)
-            service.trending = FakeJudge()
+            # Slot quota is max_per_day // 3; 6 leaves room for two picks in
+            # one 8-hour slot so the second unique event can join the batch.
+            service.trending = FakeJudge(max_per_day=6)
             service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
             comet = item(
                 "Rare comet visible worldwide this weekend",
@@ -1020,16 +1039,16 @@ class ServiceIntegrationTests(unittest.TestCase):
             self.assertEqual(len(message.event_keys), 1)
             service.close()
 
-    def test_trending_daily_cap_limits_buffering(self) -> None:
+    def test_trending_slot_cap_limits_buffering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = self.make_service(directory)
             judge = FakeJudge()
             service.trending = judge
             service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
-            service.store.set_meta(
-                "trending_day", NOW.astimezone(SGT).date().isoformat(), NOW
-            )
-            service.store.set_meta("trending_count", "3", NOW)
+            local = NOW.astimezone(SGT)
+            slot_key = f"{local.date().isoformat()}:{local.hour // 8}"
+            service.store.set_meta("trending_slot", slot_key, NOW)
+            service.store.set_meta("trending_slot_count", "1", NOW)
             comet = item(
                 "Rare comet visible worldwide this weekend",
                 identity="cap-comet",
@@ -1038,7 +1057,9 @@ class ServiceIntegrationTests(unittest.TestCase):
             )
             service.collect = lambda now: ([comet], [], [])
             service.run_once(NOW)
-            self.assertEqual(judge.remaining_seen, [0])
+            # Quota for max_per_day=3 is one per 8-hour slot, already spent:
+            # the judge is never even consulted.
+            self.assertEqual(judge.offered, [])
             self.assertEqual(
                 len(service.store.ready_p1(NOW, NOW - timedelta(minutes=120))),
                 0,
@@ -2398,6 +2419,806 @@ class ComicWiringTests(unittest.TestCase):
             self.assertEqual(sent, 0)
             service.comic.for_event.assert_not_called()
             service.close()
+
+
+class ClusterEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+        self.engine = ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg", "Financial Times"],
+        )
+
+    @staticmethod
+    def _filing(identity: str, source: str, title: str, minutes_old: int) -> NewsItem:
+        return item(
+            title,
+            identity=identity,
+            source=source,
+            source_tier="secondary",
+            minutes_old=minutes_old,
+        )
+
+    def _shelf_story(self) -> list[int | None]:
+        return [
+            self.engine.add(
+                self._filing(
+                    "shelf-reuters",
+                    "Reuters",
+                    "Antarctic ice shelf shows record seasonal retreat",
+                    20,
+                ),
+                NOW,
+            ),
+            self.engine.add(
+                self._filing(
+                    "shelf-bloomberg",
+                    "Bloomberg",
+                    "Scientists confirm record retreat of Antarctic ice shelf",
+                    12,
+                ),
+                NOW,
+            ),
+            self.engine.add(
+                self._filing(
+                    "shelf-ft",
+                    "Financial Times",
+                    "Antarctic ice shelf retreat accelerates, researchers warn",
+                    6,
+                ),
+                NOW,
+            ),
+        ]
+
+    def test_tokenize_keeps_content_words_only(self) -> None:
+        tokens = tokenize("Breaking News: US to act on AI rules today")
+        self.assertIn("act", tokens)
+        self.assertIn("rules", tokens)
+        for noise in ("breaking", "news", "today", "us", "to", "ai"):
+            self.assertNotIn(noise, tokens)
+        digits = tokenize("Magnitude 7 quake leaves 79 dead")
+        self.assertIn("79", digits)
+        self.assertNotIn("7", digits)
+
+    def test_shared_tokens_join_one_story_and_strangers_found_new(self) -> None:
+        first, second, third = self._shelf_story()
+        stranger = self.engine.add(
+            self._filing(
+                "shelf-stranger",
+                "Reuters",
+                "Parliament debates fisheries quota reform bill",
+                10,
+            ),
+            NOW,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertIsNotNone(stranger)
+        self.assertNotEqual(first, stranger)
+
+    def test_add_is_idempotent_by_item_identity(self) -> None:
+        filing = self._filing(
+            "shelf-idem",
+            "Reuters",
+            "Antarctic ice shelf shows record seasonal retreat",
+            20,
+        )
+        first = self.engine.add(filing, NOW)
+        again = self.engine.add(filing, NOW + timedelta(minutes=2))
+        self.assertEqual(first, again)
+        members = self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM cluster_member"
+        ).fetchone()
+        self.assertEqual(int(members["n"]), 1)
+
+    def test_sparse_title_is_rejected(self) -> None:
+        self.assertIsNone(
+            self.engine.add(self._filing("sparse", "Reuters", "Markets today", 5), NOW)
+        )
+
+    def test_stale_cluster_does_not_absorb_new_filing(self) -> None:
+        first = self.engine.add(
+            self._filing(
+                "age-a",
+                "Reuters",
+                "Antarctic ice shelf shows record seasonal retreat",
+                20,
+            ),
+            NOW,
+        )
+        later = self.engine.add(
+            self._filing(
+                "age-b",
+                "Bloomberg",
+                "Scientists confirm record retreat of Antarctic ice shelf",
+                12,
+            ),
+            NOW + timedelta(hours=13),
+        )
+        self.assertNotEqual(first, later)
+
+    def test_three_majors_inside_window_form_burst_candidate(self) -> None:
+        self._shelf_story()
+        candidates = self.engine.burst_candidates(NOW)
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate["representative"].identity, "shelf-reuters")
+        self.assertEqual(len(candidate["headlines"]), 3)
+        self.assertTrue(candidate["scope"])
+        self.engine.mark_promoted(int(candidate["cluster_id"]), NOW)
+        self.assertEqual(self.engine.burst_candidates(NOW), [])
+
+    def test_two_majors_are_not_a_burst(self) -> None:
+        self._shelf_story()[0]
+        self.store.connection.execute(
+            "DELETE FROM cluster_member WHERE item_identity = ?", ("shelf-ft",)
+        )
+        self.store.connection.commit()
+        self.assertEqual(self.engine.burst_candidates(NOW), [])
+
+    def test_spread_out_first_filings_are_not_a_burst(self) -> None:
+        self.engine.add(
+            self._filing(
+                "spread-a",
+                "Reuters",
+                "Antarctic ice shelf shows record seasonal retreat",
+                240,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "spread-b",
+                "Bloomberg",
+                "Scientists confirm record retreat of Antarctic ice shelf",
+                120,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "spread-c",
+                "Financial Times",
+                "Antarctic ice shelf retreat accelerates, researchers warn",
+                5,
+            ),
+            NOW,
+        )
+        self.assertEqual(self.engine.burst_candidates(NOW), [])
+
+    def test_non_major_pileup_is_not_a_burst(self) -> None:
+        for index, source in enumerate(("Some Blog", "Other Blog", "Third Blog")):
+            self.engine.add(
+                self._filing(
+                    f"blogs-{index}",
+                    source,
+                    "Antarctic ice shelf shows record seasonal retreat",
+                    20 - index,
+                ),
+                NOW,
+            )
+        self.assertEqual(self.engine.burst_candidates(NOW), [])
+
+    def test_top_clusters_rank_major_consensus_first(self) -> None:
+        self.engine.add(
+            self._filing(
+                "rank-a1",
+                "Some Blog",
+                "Chile copper mines halt production after nationwide power failure",
+                30,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "rank-a2",
+                "Other Blog",
+                "Nationwide power failure halts Chile copper production",
+                25,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "rank-a3",
+                "Third Blog",
+                "Chile copper production halted by power failure",
+                20,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "rank-b1",
+                "Reuters",
+                "Antarctic ice shelf shows record seasonal retreat",
+                10,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            self._filing(
+                "rank-c1",
+                "Some Blog",
+                "Parliament debates fisheries quota reform bill",
+                5,
+            ),
+            NOW,
+        )
+        top = self.engine.top_clusters(
+            NOW - timedelta(hours=1), NOW + timedelta(hours=1), limit=8
+        )
+        self.assertEqual(len(top), 2)
+        self.assertEqual(top[0]["major_count"], 1)
+        self.assertEqual(top[0]["rep_source"], "Reuters")
+        self.assertEqual(top[1]["member_count"], 3)
+
+    def test_prune_removes_expired_clusters_and_members(self) -> None:
+        self._shelf_story()
+        self.engine.prune(NOW + timedelta(hours=49))
+        for table in ("story_cluster", "cluster_member"):
+            count = self.store.connection.execute(
+                f"SELECT COUNT(*) AS n FROM {table}"  # noqa: S608
+            ).fetchone()
+            self.assertEqual(int(count["n"]), 0)
+
+
+class BurstPromotionTests(unittest.TestCase):
+    @staticmethod
+    def _burst_trio() -> list[NewsItem]:
+        return [
+            item(
+                "Antarctic ice shelf shows record seasonal retreat",
+                identity="burst-reuters",
+                source="Reuters",
+                source_tier="secondary",
+                minutes_old=20,
+            ),
+            item(
+                "Scientists confirm record retreat of Antarctic ice shelf",
+                identity="burst-bloomberg",
+                source="Bloomberg",
+                source_tier="secondary",
+                minutes_old=12,
+            ),
+            item(
+                "Antarctic ice shelf retreat accelerates, researchers warn",
+                identity="burst-ft",
+                source="Financial Times",
+                source_tier="secondary",
+                minutes_old=6,
+            ),
+        ]
+
+    def test_three_major_filings_promote_burst_p0(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            judge = FakeJudge(picks=False, burst_verdict=True)
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            service.collect = lambda now: (self._burst_trio(), [], [])
+            stats = service.run_once(NOW)
+            self.assertEqual(stats["sent"], 1)
+            message, thread = service.delivery.messages[0]
+            self.assertEqual(message.level, "P0")
+            self.assertEqual(thread, NEWS_THREAD)
+            self.assertTrue(message.event_keys[0].startswith("world_burst"))
+            self.assertEqual(len(judge.burst_calls), 1)
+            service.close()
+
+    def test_judge_rejection_is_permanent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            judge = FakeJudge(picks=False, burst_verdict=False)
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            service.collect = lambda now: (self._burst_trio(), [], [])
+            self.assertEqual(service.run_once(NOW)["sent"], 0)
+            self.assertEqual(len(judge.burst_calls), 1)
+            service.collect = lambda now: ([], [], [])
+            service.run_once(NOW + timedelta(minutes=2))
+            # mark_promoted on rejection: the same cluster is never re-judged.
+            self.assertEqual(len(judge.burst_calls), 1)
+            self.assertEqual(service.delivery.messages, [])
+            service.close()
+
+    def test_judge_outage_retries_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            judge = FakeJudge(picks=False, burst_verdict=None)
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            service.collect = lambda now: (self._burst_trio(), [], [])
+            self.assertEqual(service.run_once(NOW)["sent"], 0)
+            self.assertEqual(len(judge.burst_calls), 1)
+            judge.burst_verdict = True
+            service.collect = lambda now: ([], [], [])
+            stats = service.run_once(NOW + timedelta(minutes=2))
+            self.assertEqual(stats["sent"], 1)
+            self.assertEqual(len(judge.burst_calls), 2)
+            service.close()
+
+    def test_vocab_story_escalates_without_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            judge = FakeJudge(picks=False)
+            service.trending = judge
+            quake = [
+                item(
+                    "Powerful earthquake strikes northern Chile coast",
+                    identity="quake-reuters",
+                    source="Reuters",
+                    source_tier="secondary",
+                    minutes_old=20,
+                ),
+                item(
+                    "Northern Chile earthquake prompts coastal evacuations",
+                    identity="quake-bloomberg",
+                    source="Bloomberg",
+                    source_tier="secondary",
+                    minutes_old=12,
+                ),
+                item(
+                    "Chile earthquake: tsunami warning issued for northern coast",
+                    identity="quake-ft",
+                    source="Financial Times",
+                    source_tier="secondary",
+                    minutes_old=6,
+                ),
+            ]
+            for filing in quake:
+                service.clusters.add(filing, NOW)
+            events: list[AlertEvent] = []
+            service._burst_promotions(NOW, events)
+            self.assertEqual(len(events), 1)
+            assessment = events[0].assessment
+            self.assertEqual(assessment.level, "P0")
+            self.assertFalse(assessment.requires_corroboration)
+            self.assertEqual(assessment.category, "disaster")
+            self.assertEqual(judge.burst_calls, [])
+            service.close()
+
+
+class MacroDigestTests(unittest.TestCase):
+    @staticmethod
+    def _macro_event(identity: str, country: str) -> AlertEvent:
+        release = NewsItem(
+            identity=identity,
+            title=f"{country} CPI YoY: actual 3.2, estimate 2.9",
+            url="https://example.com/macro",
+            source="FMP Economic Calendar",
+            source_id="fmp_macro",
+            source_tier="structured",
+            published_at=NOW - timedelta(minutes=5),
+            fetched_at=NOW,
+            actual=3.2,
+            estimate=2.9,
+            unit="%",
+            raw={"country": country},
+        )
+        assessment = Assessment(
+            level="P0",
+            category="macro",
+            event_key=f"macro:cpi:{identity}",
+            material_hash=identity,
+            reason="surprise 0.3pp",
+            requires_corroboration=False,
+            region="global",
+            action="data_release",
+            entities=(),
+        )
+        return AlertEvent(assessment=assessment, items=[release])
+
+    def test_same_country_prints_coalesce_into_one_digest(self) -> None:
+        events = [
+            self._macro_event("mac-us-1", "US"),
+            self._macro_event("mac-us-2", "US"),
+            self._macro_event("mac-jp-1", "JP"),
+        ]
+        singles, digests = RadarService._coalesce_macro(events)
+        self.assertEqual(
+            [event.assessment.event_key for event in singles],
+            ["macro:cpi:mac-jp-1"],
+        )
+        self.assertEqual(len(digests), 1)
+        self.assertEqual(len(digests[0]), 2)
+
+    def test_distinct_or_unknown_countries_stay_single(self) -> None:
+        events = [
+            self._macro_event("mac-us", "US"),
+            self._macro_event("mac-jp", "JP"),
+            self._macro_event("mac-blank", ""),
+        ]
+        singles, digests = RadarService._coalesce_macro(events)
+        self.assertEqual(len(singles), 3)
+        self.assertEqual(digests, [])
+
+    def test_digest_chunks_at_render_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            group = [self._macro_event(f"mac-chunk-{i}", "US") for i in range(7)]
+            sent = service._publish_macro_digest(group, NOW, quiet=False)
+            self.assertEqual(sent, 2)
+            first, second = service.delivery.messages
+            self.assertEqual(first[0].level, "P1")
+            self.assertEqual(len(first[0].event_keys), 5)
+            self.assertEqual(len(second[0].event_keys), 2)
+            service.close()
+
+    def test_quiet_window_queues_digest_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            group = [self._macro_event(f"mac-quiet-{i}", "US") for i in range(2)]
+            sent = service._publish_macro_digest(group, NOW, quiet=True)
+            self.assertEqual(sent, 0)
+            self.assertEqual(service.delivery.messages, [])
+            row = service.store.connection.execute(
+                "SELECT last_error FROM pending_delivery"
+            ).fetchone()
+            self.assertEqual(row["last_error"], "quiet_window")
+            service.close()
+
+
+class BriefComposerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+        self.engine = ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg", "Financial Times"],
+        )
+        self.composer = BriefComposer(
+            store=self.store,
+            engine=self.engine,
+            base_url="",
+            api_key="",
+            model="",
+            timeout=5,
+            max_items=8,
+            max_visible_chars=950,
+            morning_sgt="07:30",
+            evening_sgt="20:30",
+        )
+
+    def test_due_slots_and_expiry(self) -> None:
+        # NOW is 18:00 SGT: between the morning window's end and the evening.
+        self.assertIsNone(self.composer.due(NOW))
+        self.assertEqual(self.composer.due(NOW - timedelta(hours=10)), "morning")
+        # A morning missed until 13:00 SGT expires instead of arriving stale.
+        self.assertIsNone(self.composer.due(NOW - timedelta(hours=5)))
+        self.assertEqual(self.composer.due(NOW + timedelta(hours=3)), "evening")
+
+    def test_mark_sent_makes_each_slot_at_most_once(self) -> None:
+        evening = NOW + timedelta(hours=3)
+        self.assertEqual(self.composer.due(evening), "evening")
+        self.composer.mark_sent("evening", evening)
+        self.assertIsNone(self.composer.due(evening))
+
+    def test_compose_empty_window_emits_placeholder(self) -> None:
+        message, comic_entries = self.composer.compose(
+            "evening", NOW + timedelta(hours=3)
+        )
+        self.assertEqual(message.level, "BRIEF")
+        self.assertEqual(message.event_keys, ["brief:evening:2026-07-25"])
+        self.assertIn("世界晚报 · 7月25日 周六", message.plain_text)
+        self.assertIn("本时段无达到整理门槛的世界大事。", message.plain_text)
+        self.assertIn("窗口13小时 · 告警0条 · 故事簇0个", message.plain_text)
+        self.assertLessEqual(visible_length(message.html), 950)
+        self.assertEqual(comic_entries, [])
+
+    def test_compose_degrades_to_mechanical_line_without_llm(self) -> None:
+        self.engine.add(
+            item(
+                "Chile copper mines halt production after nationwide power failure",
+                identity="brief-reuters",
+                source="Reuters",
+                source_tier="secondary",
+                minutes_old=60,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            item(
+                "Nationwide power failure halts Chile copper production",
+                identity="brief-bloomberg",
+                source="Bloomberg",
+                source_tier="secondary",
+                minutes_old=50,
+            ),
+            NOW,
+        )
+        message, comic_entries = self.composer.compose(
+            "evening", NOW + timedelta(hours=3)
+        )
+        self.assertIn("2家大社在报", message.plain_text)
+        self.assertIn("（2家大社）", message.plain_text)
+        self.assertEqual(len(comic_entries), 1)
+        self.assertEqual(comic_entries[0][0], "brief")
+
+    def test_gated_line_rejects_invented_numbers_and_bare_english(self) -> None:
+        story: dict[str, object] = {
+            "titles": [
+                "Chile copper mines halt production after nationwide power failure"
+            ],
+            "major_count": 2,
+            "member_count": 2,
+            "rep_title": (
+                "Chile copper mines halt production after nationwide power failure"
+            ),
+        }
+        clean = self.composer._gated_line("智利铜矿因全国停电停产", story)
+        self.assertEqual(clean, "智利铜矿因全国停电停产")
+        invented = self.composer._gated_line("智利3座铜矿停产", story)
+        self.assertTrue(invented.startswith("2家大社在报"))
+        bare = self.composer._gated_line("停产影响 Chile mines 出口", story)
+        self.assertTrue(bare.startswith("2家大社在报"))
+
+    def test_continuity_tags_advance_across_days_only(self) -> None:
+        stories: list[dict[str, object]] = [
+            {
+                "id": 7,
+                "titles": [
+                    "Chile copper mines halt production after nationwide power failure"
+                ],
+                "major_count": 2,
+                "member_count": 3,
+                "rep_title": (
+                    "Chile copper mines halt production after nationwide power failure"
+                ),
+            }
+        ]
+        self.store.set_meta(
+            "brief_continuity",
+            json.dumps(
+                [
+                    {
+                        "tokens": ["chile", "copper", "production", "failure"],
+                        "days": 1,
+                        "date": "2026-07-24",
+                    }
+                ]
+            ),
+            NOW,
+        )
+        tags = self.composer._continuity_tags(NOW, stories)
+        self.assertEqual(tags, {7: "连续第2天"})
+        # The evening rerun on the same date repeats Day-2, not Day-3.
+        tags_again = self.composer._continuity_tags(NOW, stories)
+        self.assertEqual(tags_again, {7: "连续第2天"})
+
+
+class BriefServiceTests(unittest.TestCase):
+    def test_evening_brief_dispatches_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(hours=1))
+            service.briefs_enabled = True
+            service.collect = lambda now: ([], [], [])
+            due_at = NOW + timedelta(hours=2, minutes=35)  # 20:35 SGT
+            service.run_once(due_at)
+            self.assertEqual(len(service.delivery.messages), 1)
+            message, thread = service.delivery.messages[0]
+            self.assertEqual(message.level, "BRIEF")
+            self.assertEqual(thread, NEWS_THREAD)
+            self.assertEqual(service.store.get_meta("brief_evening_date"), "2026-07-25")
+            service.run_once(due_at + timedelta(minutes=2))
+            self.assertEqual(len(service.delivery.messages), 1)
+            service.close()
+
+
+class SourceBaselineTests(unittest.TestCase):
+    def test_new_source_gets_one_swallowed_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory, baseline=True)
+            fed = item(
+                "Federal Reserve issues FOMC statement",
+                identity="grow-fed",
+                category_hint="central_bank",
+            )
+            service.collect = lambda now: ([fed], [], [])
+            self.assertEqual(service.run_once(NOW)["status"], "baseline")
+            newcomer = item(
+                "Bank of England holds interest rates steady",
+                identity="grow-yonhap-1",
+                source="Yonhap",
+                source_tier="primary",
+                minutes_old=3,
+            )
+            service.collect = lambda now: ([newcomer], [], [])
+            stats = service.run_once(NOW + timedelta(minutes=2))
+            self.assertEqual(stats["sent"], 0)
+            self.assertEqual(service.delivery.messages, [])
+            self.assertNotEqual(service.store.get_meta("source_baseline:yonhap"), "")
+            follow = item(
+                "Bank of Japan announces emergency rate hike",
+                identity="grow-yonhap-2",
+                source="Yonhap",
+                source_tier="primary",
+                minutes_old=2,
+            )
+            service.collect = lambda now: ([follow], [], [])
+            stats = service.run_once(NOW + timedelta(minutes=4))
+            self.assertEqual(stats["sent"], 1)
+            self.assertEqual(len(service.delivery.messages), 1)
+            service.close()
+
+
+class SilentPathTests(unittest.TestCase):
+    def test_reputable_wait_logs_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            first = item(
+                "Fed cuts rates in surprise decision",
+                identity="fringe-a",
+                source="Random Blog",
+                source_tier="secondary",
+            )
+            second = item(
+                "Federal Reserve cuts rates in surprise decision",
+                identity="fringe-b",
+                source="Obscure Wire",
+                source_tier="secondary",
+                minutes_old=3,
+            )
+            service.collect = lambda now: ([first], [], [])
+            service.run_once(NOW)
+            service.collect = lambda now: ([second], [], [])
+            with self.assertLogs("radar.service", level="INFO") as logs:
+                stats = service.run_once(NOW + timedelta(minutes=2))
+            self.assertEqual(stats["sent"], 0)
+            self.assertTrue(any("p0_waiting_reputable" in line for line in logs.output))
+            service.close()
+
+    def test_expired_p1_logs_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.trending = FakeJudge()
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            teaser = item(
+                "Rare comet visible worldwide this weekend",
+                identity="expire-comet",
+                source="Reuters",
+                source_tier="secondary",
+            )
+            service.collect = lambda now: ([teaser], [], [])
+            service.run_once(NOW)
+            service.collect = lambda now: ([], [], [])
+            with self.assertLogs("radar.service", level="WARNING") as logs:
+                service.run_once(NOW + timedelta(minutes=185))
+            self.assertTrue(any("p1_expired" in line for line in logs.output))
+            self.assertEqual(service.delivery.messages, [])
+            service.close()
+
+    def test_near_duplicate_item_is_still_marked_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            first = item(
+                "Rare comet visible worldwide this weekend",
+                identity="comet-a",
+                source="Reuters",
+                source_tier="secondary",
+            )
+            second = item(
+                "Rare comet visible worldwide this weekend",
+                identity="comet-b",
+                source="Bloomberg",
+                source_tier="secondary",
+                minutes_old=3,
+            )
+            service.collect = lambda now: ([first], [], [])
+            service.run_once(NOW)
+            service.collect = lambda now: ([second], [], [])
+            service.run_once(NOW + timedelta(minutes=2))
+            self.assertTrue(service.store.item_seen("comet-b"))
+            service.close()
+
+
+class TrendingSlotResetTests(unittest.TestCase):
+    def test_new_slot_restores_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegrationTests().make_service(directory)
+            judge = FakeJudge()
+            service.trending = judge
+            service.store.mark_baseline_complete(NOW - timedelta(minutes=20))
+            local = NOW.astimezone(SGT)
+            spent_slot = f"{local.date().isoformat()}:{local.hour // 8 - 1}"
+            service.store.set_meta("trending_slot", spent_slot, NOW)
+            service.store.set_meta("trending_slot_count", "1", NOW)
+            teaser = item(
+                "Rare comet visible worldwide this weekend",
+                identity="slot-comet",
+                source="Reuters",
+                source_tier="secondary",
+            )
+            service.collect = lambda now: ([teaser], [], [])
+            service.run_once(NOW)
+            self.assertEqual(len(judge.offered), 1)
+            self.assertEqual(
+                service.store.get_meta("trending_slot"),
+                f"{local.date().isoformat()}:{local.hour // 8}",
+            )
+            self.assertEqual(service.store.get_meta("trending_slot_count"), "1")
+            service.close()
+
+
+class EntityAliasTests(unittest.TestCase):
+    def test_boeing_headline_does_not_tag_bank_of_england(self) -> None:
+        result = trending_assessment(
+            item(
+                "Boeing wins record aircraft order from Asian carrier",
+                source="Reuters",
+                source_tier="secondary",
+            )
+        )
+        self.assertNotIn("BOE", result.entities)
+        self.assertIn("BOEING", result.entities)
+
+    def test_possessive_fed_headline_still_tags_fed(self) -> None:
+        result = assess(
+            item(
+                "Fed's Powell signals emergency rate cut",
+                category_hint="central_bank",
+            ),
+            CONFIG,
+        )
+        self.assertIsNotNone(result)
+        self.assertIn("FED", result.entities)
+
+    def test_curly_apostrophe_pboc_alias(self) -> None:
+        result = assess(
+            item(
+                "People’s Bank of China cuts key policy rate",
+                source="Xinhua",
+                category_hint="central_bank",
+            ),
+            CONFIG,
+        )
+        self.assertIsNotNone(result)
+        self.assertIn("PBOC", result.entities)
+
+
+class WalCheckpointTests(unittest.TestCase):
+    def test_prune_checkpoints_wal_once_per_sgt_day(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RadarStore(Path(directory) / "radar.sqlite3")
+            store.prune(NOW, 30, item_retention_days=7, delivery_retention_days=90)
+            self.assertEqual(store.get_meta("wal_checkpoint_date"), "2026-07-25")
+            store.prune(
+                NOW + timedelta(hours=1),
+                30,
+                item_retention_days=7,
+                delivery_retention_days=90,
+            )
+            self.assertEqual(store.get_meta("wal_checkpoint_date"), "2026-07-25")
+            store.close()
+
+
+class WorldSlotTests(unittest.TestCase):
+    def test_discovery_queries_include_world_slot(self) -> None:
+        queries = discovery_queries(NOW.astimezone(SGT))
+        self.assertEqual(len(queries), 4)
+        name, query = queries[3]
+        self.assertEqual(name, "world")
+        self.assertIn("earthquake", query)
+
+    def test_gdelt_world_query_targets_disaster_and_conflict_themes(self) -> None:
+        self.assertIn("theme:NATURAL_DISASTER", GdeltCollector.WORLD_QUERY)
+        self.assertIn("theme:ARMEDCONFLICT", GdeltCollector.WORLD_QUERY)
 
 
 if __name__ == "__main__":
