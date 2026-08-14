@@ -46,6 +46,10 @@ CATEGORY_SCENES = {
         "a giant microscope casting its glow over a shadowed world map"
     ),
     "trending": "a crowd in a town square gathered around a glowing globe",
+    "world_burst": (
+        "searchlights from many rooftops converging on one point in the night sky"
+    ),
+    "brief": ("a small figure on a hilltop watching a vast landscape light up at dawn"),
 }
 DEFAULT_SCENE = "a lighthouse beam sweeping across a dark stormy sea"
 

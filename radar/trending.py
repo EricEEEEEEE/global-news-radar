@@ -114,3 +114,64 @@ class TrendingJudge:
                 ",".join(item.identity[:12] for item in picks),
             )
         return picks
+
+    def judge_burst(self, headlines: list[tuple[str, str]]) -> bool | None:
+        """Yes/no gate for a vocab-less burst: is this a major world event?
+
+        Several major outlets filing the same story inside 90 minutes is the
+        mechanical trigger; this call only separates a genuinely major world
+        event from entertainment, sport and routine coverage that also bursts.
+        Returns None when the judge cannot answer (disabled, transport, parse)
+        so the caller may retry the cluster next cycle; False is a permanent
+        editorial rejection.
+        """
+        if not self.enabled or not headlines:
+            return None
+        prompt = {
+            "task": (
+                "多家国际大社在90分钟内同时报道了同一件事。"
+                "判断它是否是值得立即推送的重大世界事件："
+                "战争或军事冲突升级、重大灾难、政变、恐怖袭击、"
+                "公共卫生危机、重大政治剧变等。"
+                "娱乐、体育、公司新闻、例行数据、软性专题一律不算。"
+            ),
+            "requirements": {
+                "output": '严格 JSON: {"major_world_event": true 或 false}',
+            },
+            "headlines": [
+                {"source": source, "title": title} for source, title in headlines[:8]
+            ],
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "temperature": 0,
+                    "max_tokens": 60,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是克制的新闻编辑。只输出 JSON。",
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(prompt, ensure_ascii=False),
+                        },
+                    ],
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            verdict = json.loads(content)["major_world_event"]
+        except Exception as exc:  # noqa: BLE001
+            self.failed += 1
+            LOGGER.warning("burst_judge_failed error=%s", redact_secrets(exc))
+            return None
+        return bool(verdict)

@@ -398,6 +398,86 @@ def render_p1(
     )
 
 
+def render_brief(
+    *,
+    header: str,
+    lines: list[str],
+    footer: str,
+    event_key: str,
+    now: datetime,
+    max_visible_chars: int,
+) -> RenderedMessage:
+    """One daily-brief message: fixed header, bullet lines, stats footer.
+
+    Lines arrive pre-gated (numbers and bare English already checked) as plain
+    text. Overflow drops whole trailing lines so every surviving line stays
+    intact and attributable; a single oversized line is clipped, not failed.
+    """
+    local_time = now.astimezone(SGT).strftime("%H:%M")
+    selected = [line for line in lines if line.strip()] or ["（本时段无条目）"]
+
+    def build(current: list[str]) -> str:
+        bullets = "\n".join(f"• {html.escape(line)}" for line in current)
+        return (
+            f"🌍 <b>{html.escape(header)}</b>\n"
+            f"<blockquote>{bullets}</blockquote>\n"
+            f"<i>{html.escape(footer)} · 雷达 {local_time} SGT</i>"
+        )
+
+    body = build(selected)
+    while len(selected) > 1 and visible_length(body) > max_visible_chars:
+        selected = selected[:-1]
+        body = build(selected)
+    if visible_length(body) > max_visible_chars:
+        overhead = visible_length(build([""]))
+        selected = [_clip(selected[0], max(24, max_visible_chars - overhead))]
+        body = build(selected)
+    validate_html(body, max_visible_chars)
+    digest = hashlib.md5(body.encode("utf-8")).hexdigest()  # nosec B324
+    visual_evidence: list[dict[str, str]] = [
+        {
+            "label": "条目数量",
+            "value": str(len(selected)),
+            "role": "scalar",
+            "source_path": "$.line_count",
+        },
+        {
+            "label": "生成时间",
+            "value": now.isoformat(),
+            "role": "time",
+            "source_path": "$.rendered_at",
+        },
+    ]
+    for index, line in enumerate(selected):
+        visual_evidence.append(
+            {
+                "label": f"条目 {index + 1}",
+                "value": line,
+                "role": "status",
+                "source_path": f"$.lines[{index}]",
+            }
+        )
+    visual_spec = _visual_spec(
+        primary_question="过去半天世界发生了什么？",
+        headline=header,
+        answer="；".join(selected[:4]),
+        intent="digest",
+        grammar="html-digest",
+        roles=["scalar", "status", "time"],
+        evidence=visual_evidence,
+    )
+    return RenderedMessage(
+        level="BRIEF",
+        html=body,
+        plain_text=strip_html(body),
+        event_keys=[event_key],
+        content_hash=digest,
+        evidence=[{"line": line} for line in selected],
+        created_at=now,
+        visual_spec=visual_spec,
+    )
+
+
 def outbox_manifest(
     message: RenderedMessage,
     delivery: dict[str, object],

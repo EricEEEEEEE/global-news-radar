@@ -165,6 +165,13 @@ def discovery_queries(now_sgt: datetime) -> list[tuple[str, str]]:
         )
     else:
         queries.append(("us", "Fed Treasury US market breaking news when:1h"))
+    queries.append(
+        (
+            "world",
+            "earthquake OR tsunami OR coup OR ceasefire OR airstrike "
+            "OR outbreak when:1h",
+        )
+    )
     return queries
 
 
@@ -195,16 +202,23 @@ class GoogleNewsCollector:
 
 class GdeltCollector:
     ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+    # GDELT is theme-indexed: the keyword queries above are Google News
+    # syntax whose implicit AND matches next to nothing here. World-event
+    # themes give this fallback tier its own beat — disasters, conflicts,
+    # health crises — instead of echoing the regional market query.
+    WORLD_QUERY = (
+        "(theme:NATURAL_DISASTER OR theme:ARMEDCONFLICT"
+        " OR theme:HEALTH_PANDEMIC OR theme:TERROR)"
+    )
 
     def __init__(self, client: HttpClient):
         self.client = client
 
     def collect(self, now: datetime, now_sgt: datetime) -> list[NewsItem]:
-        query = discovery_queries(now_sgt)[-1][1].replace(" when:1h", "")
         response = self.client.get(
             self.ENDPOINT,
             params={
-                "query": query,
+                "query": self.WORLD_QUERY,
                 "mode": "artlist",
                 "format": "json",
                 "maxrecords": 50,
