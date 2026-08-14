@@ -67,6 +67,7 @@ CENTRAL_BANK_ENTITIES = {
     "people's bank of china": "PBOC",
     "pboc": "PBOC",
     "bank of england": "BOE",
+    " boe ": "BOE",
 }
 
 COUNTRY_ALIASES = {
@@ -127,6 +128,32 @@ ENTITY_ALIASES = {
     "nvidia": "NVDA",
     "tesla": "TSLA",
 }
+
+
+def _normalize_entity_text(text: str) -> str:
+    """Fold punctuation variants so vocabulary aliases match real headlines.
+
+    Possessives and curly apostrophes are the common misses: "Fed's Powell"
+    never contained the padded alias "fed ", and a headline writing People’s
+    with U+2019 never matched the ASCII alias. Dots survive untouched so
+    "u.s." keeps matching as written; padding spaces survive so padded
+    aliases still anchor at word boundaries.
+    """
+    value = text.replace("’", "'")
+    value = re.sub(r"'s\b", " ", value)
+    value = re.sub(r'[,;:!?()\[\]"“”]', " ", value)
+    return re.sub(r"\s+", " ", value)
+
+
+# Both sides of the containment check get the same folding, otherwise the
+# normalised text "people bank of china" no longer contains the raw alias.
+_NORMALIZED_ENTITY_ALIASES = {
+    _normalize_entity_text(alias): canonical
+    for alias, canonical in ENTITY_ALIASES.items()
+}
+_NORMALIZED_CENTRAL_BANK_ALIASES = tuple(
+    _normalize_entity_text(alias) for alias in CENTRAL_BANK_ENTITIES
+)
 
 CENTRAL_BANK_ACTIONS_CJK = (
     "加息",
@@ -298,6 +325,7 @@ ACTION_LABELS = {
     "political_crisis": "political_upheaval",
     "health_emergency": "health_emergency",
     "trending": "editor_pick",
+    "world_burst": "burst_consensus",
 }
 
 
@@ -369,9 +397,11 @@ def _macro_series(text: str) -> str:
 
 def _entities(text: str, symbol: str = "") -> tuple[str, ...]:
     """Controlled-vocabulary entities only — these are safe to key events on."""
-    lowered = text.lower()
+    lowered = _normalize_entity_text(text.lower())
     found = {
-        canonical for alias, canonical in ENTITY_ALIASES.items() if alias in lowered
+        canonical
+        for alias, canonical in _NORMALIZED_ENTITY_ALIASES.items()
+        if alias in lowered
     }
     if symbol:
         found.add(symbol.upper())
@@ -551,9 +581,36 @@ def trending_assessment(item: NewsItem) -> Assessment:
     )
 
 
+def burst_assessment(item: NewsItem, scope: str) -> Assessment:
+    """Assessment for a story that burst across major outlets without vocabulary.
+
+    The cluster's shared tokens are the scope: every outlet's own phrasing maps
+    to the same event key, which a per-title simhash would never survive.
+    """
+    action = ACTION_LABELS["world_burst"]
+    return Assessment(
+        level="P0",
+        category="world_burst",
+        event_key=_event_key(
+            category="world_burst",
+            action=action,
+            scope=scope,
+            occurred_at=item.published_at,
+        ),
+        material_hash=_material_hash(item, "world_burst", scope),
+        reason="multi-major burst",
+        requires_corroboration=False,
+        region=item.region,
+        action=action,
+        entities=_display_entities(f" {item.title} ", item.symbol),
+        topic_anchor=_topic_anchor("world_burst", action, scope),
+    )
+
+
 def assess(item: NewsItem, config: dict[str, Any]) -> Assessment | None:
     raw_text = f" {item.title} {item.summary} "
     text = raw_text.lower()
+    normalized = _normalize_entity_text(text)
     if item.source_tier not in {"primary", "structured"} and is_forecast(text):
         return None
 
@@ -566,7 +623,7 @@ def assess(item: NewsItem, config: dict[str, Any]) -> Assessment | None:
     if structured:
         level, category, reason = structured
     elif (
-        any(alias in text for alias in CENTRAL_BANK_ENTITIES)
+        any(alias in normalized for alias in _NORMALIZED_CENTRAL_BANK_ALIASES)
         and is_central_bank_action(text)
     ) or (
         item.source_tier == "primary"

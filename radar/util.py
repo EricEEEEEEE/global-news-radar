@@ -227,8 +227,8 @@ _SCALE_FACTORS = {
     "million": (Decimal(100),),  # 800万
     "mn": (Decimal(100),),
     "m": (Decimal(100),),
-    "thousand": (Decimal(1000),),  # 8000
-    "k": (Decimal(1000),),
+    "thousand": (Decimal(1000), Decimal("0.1")),  # 8000 / 150 thousand -> 15万
+    "k": (Decimal(1000), Decimal("0.1")),
 }
 
 
@@ -256,6 +256,47 @@ def echoable_numbers(value: str) -> set[str]:
         for factor in _SCALE_FACTORS[match.group(2).lower()]:
             allowed.add(format((base * factor).normalize(), "f"))
     return allowed
+
+
+# Structured rows carry the scale in their own `unit` field ("K", "M", "B"),
+# so the number is pre-divided and the tokeniser never sees a scale word next
+# to it: payrolls actual=150 with unit "K" is 150 thousand, correctly written
+# 15万 or 150000 in Chinese. Non-scale units ("%", "Low") widen nothing.
+_UNIT_SCALE_ALIASES = {
+    "t": "trillion",
+    "tn": "trillion",
+    "trn": "trillion",
+    "trillion": "trillion",
+    "trillions": "trillion",
+    "b": "billion",
+    "bn": "billion",
+    "bln": "billion",
+    "billion": "billion",
+    "billions": "billion",
+    "m": "million",
+    "mn": "million",
+    "mln": "million",
+    "million": "million",
+    "millions": "million",
+    "k": "thousand",
+    "thousand": "thousand",
+    "thousands": "thousand",
+}
+
+
+def unit_scaled_values(number: object, unit: str) -> set[str]:
+    """Chinese-scale spellings of a value whose unit is an English scale word."""
+    key = _UNIT_SCALE_ALIASES.get((unit or "").strip().lower())
+    if key is None or number is None:
+        return set()
+    try:
+        base = Decimal(str(number))
+    except InvalidOperation:
+        return set()
+    values = {format(base.normalize(), "f")}
+    for factor in _SCALE_FACTORS[key]:
+        values.add(format((base * factor).normalize(), "f"))
+    return values
 
 
 def load_env(path: Path) -> dict[str, str]:

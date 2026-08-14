@@ -104,12 +104,36 @@ CREATE TABLE IF NOT EXISTS source_health (
     failure_started_at TEXT,
     recovered_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS story_cluster (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    last_at TEXT NOT NULL,
+    tokens_json TEXT NOT NULL,
+    title TEXT NOT NULL,
+    promoted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_story_cluster_last ON story_cluster(last_at);
+
+CREATE TABLE IF NOT EXISTS cluster_member (
+    item_identity TEXT PRIMARY KEY,
+    cluster_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    is_major INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    item_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_member_cluster ON cluster_member(cluster_id);
 """
 
 
-# Infrastructure alerts travel through the same delivery path as market events.
-# They must never reach seen_topics or the exported market-event ledger.
-INFRA_EVENT_PREFIXES = ("source-error:", "source-recovery:")
+# Infrastructure alerts and daily briefs travel through the same delivery path
+# as market events. They must never reach seen_topics or the exported
+# market-event ledger.
+INFRA_EVENT_PREFIXES = ("source-error:", "source-recovery:", "brief:")
 
 
 def is_infra_event(event_key: str) -> bool:
@@ -519,6 +543,23 @@ class RadarStore:
         )
         self.connection.commit()
 
+    def pop_expired_p1(self, now: datetime) -> list[tuple[str, str]]:
+        """Expired buffer entries, removed and returned so the drop gets logged.
+
+        ready_p1 deletes these silently as a safety net; a P1 that waited for
+        a second source and never got one otherwise vanishes without a trace.
+        """
+        rows = self.connection.execute(
+            "SELECT event_key, added_at FROM p1_buffer WHERE expires_at < ?",
+            (_iso(now),),
+        ).fetchall()
+        if rows:
+            self.connection.execute(
+                "DELETE FROM p1_buffer WHERE expires_at < ?", (_iso(now),)
+            )
+            self.connection.commit()
+        return [(str(row["event_key"]), str(row["added_at"])) for row in rows]
+
     def ready_p1(
         self, now: datetime, since: datetime, limit: int = 5
     ) -> list[sqlite3.Row]:
@@ -862,6 +903,45 @@ class RadarStore:
                 """,
                 (delivery_cutoff,),
             )
+        # The daemon holds one connection forever, so nothing else ever
+        # checkpoints the WAL and it only grows. One TRUNCATE per SGT day
+        # keeps it bounded without stalling every cycle.
+        today = now.astimezone(SGT).date().isoformat()
+        if self.get_meta("wal_checkpoint_date") != today:
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.set_meta("wal_checkpoint_date", today, now)
+
+    def deliveries_between(
+        self, start: datetime, end: datetime
+    ) -> list[dict[str, str]]:
+        """Sent market events inside a window, one row per event key.
+
+        The briefs use this as the "已报" section, so infra alerts and the
+        briefs themselves stay excluded via the shared prefix filter.
+        """
+        infra_filter = " AND ".join(
+            f"k.value NOT LIKE '{prefix}%'" for prefix in INFRA_EVENT_PREFIXES
+        )
+        rows = self.connection.execute(
+            f"""
+            SELECT d.sent_at, d.level, k.value AS event_key, t.last_summary
+            FROM deliveries d
+            JOIN json_each(d.event_keys_json) k
+            LEFT JOIN seen_topics t ON t.event_key = k.value
+            WHERE d.sent_at >= ? AND d.sent_at < ? AND {infra_filter}
+            ORDER BY d.sent_at ASC, k.value ASC
+            """,
+            (_iso(start), _iso(end)),
+        ).fetchall()
+        return [
+            {
+                "sent_at": str(row["sent_at"]),
+                "level": str(row["level"]),
+                "event_key": str(row["event_key"]),
+                "summary": str(row["last_summary"] or ""),
+            }
+            for row in rows
+        ]
 
     def export_deliveries(self, path: Path) -> int:
         # json_each expands one row per event_key and joins on an exact match.

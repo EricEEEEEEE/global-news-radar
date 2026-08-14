@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import requests
 
 from .models import AlertEvent
-from .util import echoable_numbers, numeric_values
+from .util import echoable_numbers, numeric_values, unit_scaled_values
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ CATEGORY_TITLES = {
     "political_crisis": "政治局势剧变",
     "health_emergency": "公共卫生事件",
     "trending": "全球热点",
+    "world_burst": "世界突发事件",
 }
 
 CATEGORY_IMPACTS = {
@@ -40,6 +41,7 @@ CATEGORY_IMPACTS = {
     "political_crisis": "该国局势与地区稳定面临不确定性。",
     "health_emergency": "传播范围与防控措施值得关注。",
     "trending": "全球关注度高，值得了解。",
+    "world_burst": "多家国际大社同时报道，全球关注度高。",
 }
 
 
@@ -207,6 +209,10 @@ class LlmSummarizer:
             for item in event.items[:4]
         ]
         allowed_numbers = echoable_numbers(json.dumps(evidence, ensure_ascii=False))
+        for entry in evidence:
+            unit = str(entry.get("unit") or "")
+            for value in (entry.get("actual"), entry.get("estimate")):
+                allowed_numbers |= unit_scaled_values(value, unit)
         feedback = ""
         # A translation the gate rejected once is usually one correction away
         # from passing; telling the model what was wrong and asking again is
