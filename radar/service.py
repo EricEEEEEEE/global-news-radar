@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import html
 import json
 import logging
@@ -10,11 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .briefs import BriefComposer
+from .clusters import ClusterEngine
 from .comic import ComicArtist
 from .delivery import TelegramDelivery, prune_outbox
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from .policy import (
     assess,
+    burst_assessment,
     is_fresh,
     is_quiet_window,
     quiet_window_end,
@@ -152,6 +156,36 @@ class RadarService:
         self.major_sources = tuple(
             str(value).lower() for value in config["discovery"]["major_sources"]
         )
+        clusters_config = dict(config.get("clusters") or {})
+        self.clusters = ClusterEngine(
+            self.store,
+            window_hours=int(clusters_config.get("window_hours") or 12),
+            min_shared_tokens=int(clusters_config.get("min_shared_tokens") or 3),
+            burst_min_majors=int(clusters_config.get("burst_min_majors") or 3),
+            burst_window_minutes=int(clusters_config.get("burst_window_minutes") or 90),
+            major_sources=[
+                str(value) for value in config["discovery"]["major_sources"]
+            ],
+        )
+        briefs_config = dict(config.get("briefs") or {})
+        self.briefs_enabled = _env_flag(
+            env, "RADAR_BRIEFS_ENABLED", bool(briefs_config.get("enabled", False))
+        )
+        self.briefs_comic = bool(briefs_config.get("comic", True))
+        self.briefs = BriefComposer(
+            store=self.store,
+            engine=self.clusters,
+            base_url=env.get("LLM_API_BASE") or env.get("FE_LLM_API_BASE", ""),
+            api_key=env.get("LLM_API_KEY") or env.get("FE_LLM_API_KEY", ""),
+            model=env.get("LLM_MODEL")
+            or env.get("FE_LLM_MODEL")
+            or str(config["llm"]["model"] or ""),
+            timeout=int(briefs_config.get("timeout_seconds") or 60),
+            max_items=int(briefs_config.get("max_items") or 8),
+            max_visible_chars=int(briefs_config.get("max_visible_chars") or 950),
+            morning_sgt=str(briefs_config.get("morning_sgt") or "07:30"),
+            evening_sgt=str(briefs_config.get("evening_sgt") or "20:30"),
+        )
         comic_config = dict(config.get("comic") or {})
         self.comic = ComicArtist(
             enabled=_env_flag(
@@ -165,6 +199,13 @@ class RadarService:
             image_model=str(comic_config.get("image_model") or "grok-imagine-image"),
             scene_timeout=int(comic_config.get("scene_timeout_seconds") or 45),
             image_timeout=int(comic_config.get("image_timeout_seconds") or 150),
+        )
+        # Alerts stay phone-tight while the brief runs longer, so the render
+        # cap is per product; the delivery instance validates at the shared
+        # ceiling every product must fit under.
+        self.alert_visible_chars = int(
+            config["telegram"].get("alert_visible_chars")
+            or config["telegram"]["max_visible_chars"]
         )
         self.delivery = TelegramDelivery(
             token=env.get("TELEGRAM_BOT_TOKEN", ""),
@@ -414,6 +455,11 @@ class RadarService:
                 if any(major in source for major in major_sources)
             }
             if len(reputable) < 2:
+                LOGGER.info(
+                    "p0_waiting_reputable event=%s sources=%s",
+                    assessment.event_key,
+                    sorted(unique_sources),
+                )
                 return None
         return AlertEvent(assessment=assessment, items=observations or [item])
 
@@ -732,6 +778,7 @@ class RadarService:
         if first_run and bool(self.config["runtime"]["baseline_on_first_run"]):
             for item in fresh:
                 self._mark_item(item, now)
+            self._stamp_sources({item.source_id for item in items}, now)
             self.store.mark_baseline_complete(now)
             stats = {
                 "status": "baseline",
@@ -745,17 +792,25 @@ class RadarService:
             self._finish_cycle(stats, now)
             return stats
 
+        fresh = self._baseline_new_sources(items, fresh, now)
         p0_events: list[AlertEvent] = []
         trend_candidates: list[NewsItem] = []
         new_items = 0
         for item in fresh:
             try:
+                self.clusters.add(item, now)
                 new_items += self._process_item(item, now, p0_events, trend_candidates)
             except Exception:  # noqa: BLE001
                 # One malformed headline must not abort the cycle: every other
                 # item in this batch has already been marked seen and would be
                 # lost for good.
                 LOGGER.exception("item_failed identity=%s", item.identity)
+
+        try:
+            self._burst_promotions(now, p0_events)
+        except Exception:  # noqa: BLE001
+            # The burst lane is additive coverage; it must not cost the cycle.
+            LOGGER.exception("burst_promotion_failed")
 
         quiet = is_quiet_window(
             now,
@@ -767,13 +822,28 @@ class RadarService:
         for event in p0_events:
             unique_p0[event.assessment.event_key] = event
         p0_events = list(unique_p0.values())
-        for event in p0_events:
+        singles, macro_digests = self._coalesce_macro(p0_events)
+        for event in singles:
             try:
                 sent += self._publish_p0(event, now, quiet)
             except Exception:  # noqa: BLE001
                 LOGGER.exception(
                     "p0_render_failed event=%s", event.assessment.event_key
                 )
+        for group in macro_digests:
+            try:
+                sent += self._publish_macro_digest(group, now, quiet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("macro_digest_failed")
+
+        # Before ready_p1 runs below: it silently DELETEs expired rows as a
+        # safety net, which would make this trace unreachable after it.
+        for expired_key, buffered_at in self.store.pop_expired_p1(now):
+            # An editor pick that died waiting is a coverage decision worth a
+            # trace, not a silent DELETE.
+            LOGGER.warning(
+                "p1_expired event=%s buffered_at=%s", expired_key, buffered_at
+            )
 
         if not quiet:
             self._buffer_trending(trend_candidates, now)
@@ -801,13 +871,17 @@ class RadarService:
                 message = render_p1(
                     entries,
                     now,
-                    int(self.config["telegram"]["max_visible_chars"]),
+                    self.alert_visible_chars,
                 )
                 photo = self.comic.for_digest(entries)
                 if self._deliver_or_queue(
                     message, self.news_thread_id, now, photo=photo
                 ):
                     sent += 1
+            try:
+                sent += self._publish_brief(now)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("brief_failed")
 
         self._source_recovery_alerts(recoveries, now)
         self._source_error_alerts(errors, now)
@@ -817,6 +891,7 @@ class RadarService:
             item_retention_days=int(self.config["item_retention_days"]),
             delivery_retention_days=int(self.config["delivery_retention_days"]),
         )
+        self.clusters.prune(now)
         prune_outbox(
             self.root / "outbox",
             now.timestamp(),
@@ -871,15 +946,20 @@ class RadarService:
         """
         if not self.trending.enabled or not candidates:
             return
-        today = now.astimezone(SGT).date().isoformat()
-        buffered_today = (
-            int(self.store.get_meta("trending_count", "0") or "0")
-            if self.store.get_meta("trending_day", "") == today
+        # The cap is per eight-hour slot (Asia / Europe / US hand-offs in
+        # SGT), so one hot region can no longer spend the whole day's quota
+        # before the next one wakes up.
+        local = now.astimezone(SGT)
+        slot_key = f"{local.date().isoformat()}:{local.hour // 8}"
+        buffered_slot = (
+            int(self.store.get_meta("trending_slot_count", "0") or "0")
+            if self.store.get_meta("trending_slot", "") == slot_key
             else 0
         )
-        picks = self.trending.pick(
-            candidates, self.trending.max_per_day - buffered_today
-        )
+        quota = max(1, self.trending.max_per_day // 3)
+        if quota <= buffered_slot:
+            return
+        picks = self.trending.pick(candidates, quota - buffered_slot)
         for picked in picks:
             assessment = trending_assessment(picked)
             allowed, reason = self.store.topic_decision(
@@ -904,9 +984,9 @@ class RadarService:
                 expires_at=now
                 + timedelta(minutes=int(self.config["p1_expiry_minutes"])),
             )
-            buffered_today += 1
-        self.store.set_meta("trending_day", today, now)
-        self.store.set_meta("trending_count", str(buffered_today), now)
+            buffered_slot += 1
+        self.store.set_meta("trending_slot", slot_key, now)
+        self.store.set_meta("trending_slot_count", str(buffered_slot), now)
 
     def _process_item(
         self,
@@ -929,6 +1009,9 @@ class RadarService:
         if near_duplicate and not (
             event is not None and assessment.requires_corroboration
         ):
+            # Left unmarked, this item is refetched and reassessed every
+            # cycle until it goes stale; mark it so it is seen exactly once.
+            self._mark_item(item, now)
             return 0
         self._mark_item(item, now)
         allowed, reason = self.store.topic_decision(
@@ -980,7 +1063,7 @@ class RadarService:
             event,
             summary,
             now,
-            int(self.config["telegram"]["max_visible_chars"]),
+            self.alert_visible_chars,
         )
         if quiet:
             # The quiet queue serialises the message as JSON and re-sends it as
@@ -997,6 +1080,197 @@ class RadarService:
         if self._deliver_or_queue(message, self.news_thread_id, now, photo=photo):
             return 1
         return 0
+
+    def _stamp_sources(self, source_ids: set[str], now: datetime) -> None:
+        stamp = now.astimezone(SGT).date().isoformat()
+        for source_id in source_ids:
+            self.store.set_meta(f"source_baseline:{source_id}", stamp, now)
+
+    def _baseline_new_sources(
+        self, fetched: list[NewsItem], fresh: list[NewsItem], now: datetime
+    ) -> list[NewsItem]:
+        """Swallow the first batch from a source this store has never seen.
+
+        A feed added to the config mid-life arrives carrying its recent
+        history, which is new to the radar but not to the world. The rule the
+        very first run applies globally is applied per source: mark, do not
+        alert. Sources are stamped on first sight, so this costs exactly one
+        batch per new source, ever.
+        """
+        # Disabling first-run baselining is a request for raw replay; honor
+        # it at source granularity too.
+        if not bool(self.config["runtime"]["baseline_on_first_run"]):
+            return fresh
+        sighted = {item.source_id for item in fetched}
+        new_sources = {
+            source_id
+            for source_id in sighted
+            if not self.store.get_meta(f"source_baseline:{source_id}")
+        }
+        if not new_sources:
+            return fresh
+        self._stamp_sources(new_sources, now)
+        kept: list[NewsItem] = []
+        swallowed = 0
+        for item in fresh:
+            if item.source_id in new_sources:
+                self._mark_item(item, now)
+                swallowed += 1
+            else:
+                kept.append(item)
+        LOGGER.info(
+            "source_baselined sources=%s items=%s", sorted(new_sources), swallowed
+        )
+        return kept
+
+    def _burst_promotions(self, now: datetime, p0_events: list[AlertEvent]) -> None:
+        """Promote stories several major outlets broke at once (U2).
+
+        The vocabulary decides what the radar knows to watch; this lane
+        catches what it never heard of. Corroboration is inherent — the
+        trigger is distinct majors filing inside one burst window — so a
+        vocab match skips the two-source wait and is escalated to P0
+        outright, and everything else faces one editorial yes/no from the
+        judge. Both lanes share the topic and lineage gates, so they cannot
+        double-fire on one story.
+        """
+        for candidate in self.clusters.burst_candidates(now):
+            cluster_id = int(candidate["cluster_id"])
+            representative = candidate["representative"]
+            headlines = list(candidate["headlines"])
+            scope = str(candidate["scope"])
+            assessment = assess(representative, self.config)
+            if assessment is not None:
+                assessment = dataclasses.replace(
+                    assessment, level="P0", requires_corroboration=False
+                )
+            else:
+                verdict = self.trending.judge_burst(headlines)
+                if verdict is None:
+                    # Judge unavailable or undecided: retry next cycle.
+                    continue
+                if verdict is False:
+                    self.clusters.mark_promoted(cluster_id, now)
+                    LOGGER.info("burst_rejected cluster=%s scope=%s", cluster_id, scope)
+                    continue
+                assessment = burst_assessment(representative, scope)
+            allowed, reason = self.store.topic_decision(
+                event_key=assessment.event_key,
+                material_hash=assessment.material_hash,
+                level=assessment.level,
+                now=now,
+                cooldown_hours=float(self.config["topic_cooldown_hours"]),
+            )
+            if not allowed:
+                self.clusters.mark_promoted(cluster_id, now)
+                LOGGER.info(
+                    "burst_suppressed cluster=%s event=%s reason=%s",
+                    cluster_id,
+                    assessment.event_key,
+                    reason,
+                )
+                continue
+            lineage_allowed, lineage_reason, lineage_day = self.store.lineage_decision(
+                topic_anchor=assessment.topic_anchor,
+                material_hash=assessment.material_hash,
+                now=now,
+                max_gap_days=float(self.config["lineage_max_gap_days"]),
+                min_interval_minutes=float(self.config["anchor_min_interval_minutes"]),
+                daily_cap=int(self.config["anchor_daily_cap"]),
+            )
+            if not lineage_allowed:
+                self.clusters.mark_promoted(cluster_id, now)
+                LOGGER.info(
+                    "burst_lineage_suppressed cluster=%s anchor=%s reason=%s",
+                    cluster_id,
+                    assessment.topic_anchor,
+                    lineage_reason,
+                )
+                continue
+            assessment.lineage_day = lineage_day
+            p0_events.append(AlertEvent(assessment=assessment, items=[representative]))
+            self.clusters.mark_promoted(cluster_id, now)
+            LOGGER.info(
+                "burst_promoted cluster=%s event=%s majors=%s",
+                cluster_id,
+                assessment.event_key,
+                len(headlines),
+            )
+
+    @staticmethod
+    def _coalesce_macro(
+        events: list[AlertEvent],
+    ) -> tuple[list[AlertEvent], list[list[AlertEvent]]]:
+        """Merge one country's same-cycle macro prints into one digest (U7).
+
+        CPI, core CPI and jobless claims land in the same release minute;
+        three alert cards seconds apart read as spam, one card reads as a
+        release. Grouping is by the calendar row's country and only within
+        this cycle — different countries or cycles stay single alerts.
+        """
+        singles: list[AlertEvent] = []
+        groups: dict[str, list[AlertEvent]] = {}
+        for event in events:
+            item = event.primary
+            country = str((item.raw or {}).get("country") or "").strip()
+            if item.source_id == "fmp_macro" and country:
+                groups.setdefault(country, []).append(event)
+            else:
+                singles.append(event)
+        digests: list[list[AlertEvent]] = []
+        for grouped in groups.values():
+            if len(grouped) >= 2:
+                digests.append(grouped)
+            else:
+                singles.extend(grouped)
+        return singles, digests
+
+    def _publish_macro_digest(
+        self, group: list[AlertEvent], now: datetime, quiet: bool
+    ) -> int:
+        sent = 0
+        # render_p1 shows at most five entries; chunking keeps every print's
+        # event key inside some delivered message's bookkeeping.
+        for start in range(0, len(group), 5):
+            chunk = group[start : start + 5]
+            entries = [(event, self.summarizer.summarize(event)) for event in chunk]
+            message = render_p1(entries, now, self.alert_visible_chars)
+            if quiet:
+                quiet_end = quiet_window_end(
+                    now, str(self.config["quiet_window"]["end"])
+                )
+                self.store.queue_delivery(
+                    message,
+                    thread_id=self.news_thread_id,
+                    next_retry_at=quiet_end.astimezone(now.tzinfo),
+                    error="quiet_window",
+                )
+                continue
+            photo = self.comic.for_digest(entries)
+            if self._deliver_or_queue(message, self.news_thread_id, now, photo=photo):
+                sent += 1
+        return sent
+
+    def _publish_brief(self, now: datetime) -> int:
+        """Send the morning or evening world brief when its slot is due (U3).
+
+        The slot is marked spent as soon as the message is handed to delivery
+        or its retry queue: composing a second, slightly different brief for
+        the same slot would slip past the content-hash dedup and post twice.
+        """
+        if not self.briefs_enabled:
+            return 0
+        kind = self.briefs.due(now)
+        if kind is None:
+            return 0
+        message, comic_entries = self.briefs.compose(kind, now)
+        photo = self.comic.generate(comic_entries) if self.briefs_comic else None
+        delivered = self._deliver_or_queue(
+            message, self.news_thread_id, now, photo=photo
+        )
+        self.briefs.mark_sent(kind, now)
+        LOGGER.info("brief_dispatched kind=%s delivered=%s", kind, delivered)
+        return 1 if delivered else 0
 
     def _finish_cycle(self, stats: dict[str, Any], now: datetime) -> None:
         self.last_cycle_stats = stats

@@ -1,4 +1,4 @@
-version: "1.6.0"
+version: "1.7.0"
 timezone: Asia/Singapore
 poll_seconds: 120
 freshness_minutes: 75
@@ -23,7 +23,10 @@ telegram:
   chat_id: "0"
   news_thread_id: "0"
   monitor_thread_id: "0"
-  max_visible_chars: 400
+  # Delivery-level ceiling, sized for the brief (Telegram photo captions cap
+  # at 1024 visible chars). Alerts keep their old tight budget separately.
+  max_visible_chars: 1024
+  alert_visible_chars: 400
 runtime:
   baseline_on_first_run: true
   # Consecutive-failure thresholds are counts, and the wall-clock they buy
@@ -69,6 +72,26 @@ trending:
   enabled: false
   max_per_day: 3
   timeout_seconds: 45
+# Story clustering: one story filed by many outlets is one unit of work, not
+# many. A cluster where burst_min_majors distinct major outlets all file
+# within burst_window_minutes is world news by definition and is promoted to
+# an instant P0 whether or not any vocabulary rule matched it.
+clusters:
+  window_hours: 12
+  min_shared_tokens: 3
+  burst_min_majors: 3
+  burst_window_minutes: 90
+# Twice-daily world briefs, the guaranteed product of the radar day: morning
+# covers the overnight window, evening covers the day. Ships disabled like
+# every optional feature; the VPS flips it on via RADAR_BRIEFS_ENABLED.
+briefs:
+  enabled: false
+  morning_sgt: "07:30"
+  evening_sgt: "20:30"
+  max_items: 8
+  max_visible_chars: 950
+  comic: true
+  timeout_seconds: 60
 official_feeds:
   - id: fed_all
     name: Federal Reserve
@@ -108,7 +131,9 @@ official_feeds:
 discovery:
   enabled: true
   interval_cycles: 5
-  max_queries: 3
+  # 4 = breaking finance, crypto, the rotating regional slot, and the world
+  # slot (disasters, conflicts, outbreaks) added in 1.7.0.
+  max_queries: 4
   gdelt_fallback: true
   # Google News alone silences the radar whenever it rate-limits or reshapes its
   # RSS: fall back to GDELT when discovery returns a thin batch, not only an
@@ -125,6 +150,9 @@ discovery:
     - South China Morning Post
     - BBC
     - Al Jazeera
+    - Channel NewsAsia
+    - Yonhap
+    - Japan Times
   # Direct outlet feeds, so corroboration no longer depends on Google News
   # surfacing the same story twice. Every URL below was probed from the VPS and
   # returns parseable, dated entries.
@@ -178,6 +206,21 @@ discovery:
       name: CoinDesk
       url: https://www.coindesk.com/arc/outboundfeeds/rss/
       region: global
+      category_hint: discovery
+    - id: cna_top
+      name: Channel NewsAsia
+      url: https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml
+      region: asia
+      category_hint: discovery
+    - id: yonhap_news
+      name: Yonhap
+      url: https://en.yna.co.kr/RSS/news.xml
+      region: asia
+      category_hint: discovery
+    - id: japantimes_all
+      name: Japan Times
+      url: https://www.japantimes.co.jp/feed/
+      region: asia
       category_hint: discovery
 structured:
   fmp_enabled: false
