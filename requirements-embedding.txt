@@ -1,0 +1,2 @@
+# Optional: enables clusters.embedding in config/radar.yaml.
+model2vec==0.9.0

@@ -1,6 +1,6 @@
 [project]
 name = "global-news-radar"
-version = "1.4.0"
+version = "1.8.0"
 description = "Real-time, source-verified financial event radar for Telegram"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -9,6 +9,11 @@ dependencies = [
   "PyYAML==6.0.2",
   "requests==2.32.4",
 ]
+
+[project.optional-dependencies]
+# The semantic clustering backstop. Optional on purpose: it pulls numpy and
+# tokenizers, and the radar degrades to token overlap without it.
+embedding = ["model2vec==0.9.0"]
 
 [project.urls]
 Homepage = "https://github.com/EricEEEEEEE/global-news-radar"

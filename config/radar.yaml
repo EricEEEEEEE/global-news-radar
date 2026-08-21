@@ -1,4 +1,4 @@
-version: "1.7.0"
+version: "1.8.0"
 timezone: Asia/Singapore
 poll_seconds: 120
 freshness_minutes: 75
@@ -23,9 +23,11 @@ telegram:
   chat_id: "0"
   news_thread_id: "0"
   monitor_thread_id: "0"
-  # Delivery-level ceiling, sized for the brief (Telegram photo captions cap
-  # at 1024 visible chars). Alerts keep their old tight budget separately.
-  max_visible_chars: 1024
+  # Delivery-level ceiling, sized for the sectioned brief, which is a plain
+  # text message (4096 visible chars) and no longer a photo caption (1024).
+  # 1.8.0 moved the cover image to its own short-caption message so the brief
+  # itself is free to use the text budget. Alerts keep their tight budget.
+  max_visible_chars: 4000
   alert_visible_chars: 400
 runtime:
   baseline_on_first_run: true
@@ -81,6 +83,24 @@ clusters:
   min_shared_tokens: 3
   burst_min_majors: 3
   burst_window_minutes: 90
+  # Second-chance merge for the same story written in different words, e.g.
+  # "quake" vs "earthquake". Only consulted when token overlap already failed,
+  # so it can merge more but never less. model2vec runs locally on CPU with no
+  # network call -- the LLM gateway serves no embedding model.
+  #
+  # 0.72 is measured, not guessed. Replaying 2170 real clusters, it fires on
+  # 12 of them: nine are the same story split by wording (two Indonesia quake
+  # filings, four cyclospora/salmonella outbreak filings, "US sanctions more
+  # Cuban companies" vs "US imposes sanctions on nine Cuban entities"), one is
+  # wrong ("Why is EQT Holdings stock surging today?" pulled into the same
+  # sentence about NRW Holdings -- a wire template, not a story), and two are
+  # arguable. Loosening to 0.65 quadruples the count and the extra ones are
+  # mostly template collisions. Requires the optional model2vec dependency;
+  # a missing or broken model degrades silently back to token overlap.
+  embedding:
+    enabled: true
+    model: minishlab/potion-base-8M
+    threshold: 0.72
 # Twice-daily world briefs, the guaranteed product of the radar day: morning
 # covers the overnight window, evening covers the day. Ships disabled like
 # every optional feature; the VPS flips it on via RADAR_BRIEFS_ENABLED.
@@ -88,10 +108,52 @@ briefs:
   enabled: false
   morning_sgt: "07:30"
   evening_sgt: "20:30"
-  max_items: 8
-  max_visible_chars: 950
+  max_items: 10
+  max_visible_chars: 3500
   comic: true
   timeout_seconds: 60
+  # How many clusters to rank before the domain quotas pick from them. Packing
+  # 10 slots out of only 10 candidates is not a choice; 5x gives the quotas a
+  # real pool to balance the day out of.
+  candidate_multiplier: 5
+
+# Section layout for the brief. The quotas are caps, not floors: they stop one
+# loud event owning the whole brief, and on a quiet day the second packing pass
+# ignores them so unused slots still go to the highest-ranked stories.
+# Classification is keyword-first and deterministic; the LLM pass, when enabled,
+# may only override with a label from this same list and fails open to keywords.
+domains:
+  llm_enabled: false
+  model: ""
+  timeout_seconds: 30
+  quotas:
+    disaster: 2
+    politics: 3
+    economy: 2
+    science: 1
+    tech: 1
+    society: 1
+    sport: 1
+    other: 1
+  # Feeds that only ever publish one domain. Their id is a stronger signal
+  # than vocabulary: measured on 48 live sport headlines, keyword matching
+  # reached 18, because the rest name teams and players rather than the sport.
+  # A hint only breaks a tie -- two or more keyword cues still win -- so a
+  # stadium collapse filed by a sport desk still reads as a disaster.
+  source_hints:
+    usgs_quakes: disaster
+    gdacs_24h: disaster
+    who_news: science
+    sciencedaily_top: science
+    bbc_science: science
+    bbc_tech: tech
+    arstechnica: tech
+    bbc_sport: sport
+    guardian_sport: sport
+    coindesk: economy
+    marketwatch_realtime: economy
+    investing_news: economy
+    cnbc_economy: economy
 official_feeds:
   - id: fed_all
     name: Federal Reserve
@@ -221,6 +283,83 @@ discovery:
       name: Japan Times
       url: https://www.japantimes.co.jp/feed/
       region: asia
+      category_hint: discovery
+    # 1.8.0 domain supply. The brief is sectioned by domain now, and the old
+    # feed list was almost entirely finance: disaster, science, tech, sport and
+    # non-US politics had no dedicated source to be selected from. Every URL
+    # below was probed from the VPS and returned parseable, dated entries.
+    # BBC sub-feeds keep name "BBC" on purpose: major_count counts DISTINCT
+    # source names, so "BBC Sport" as its own name would let one outlet supply
+    # two of the three majors a burst promotion needs.
+    - id: usgs_quakes
+      name: USGS
+      url: https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.atom
+      region: global
+      category_hint: discovery
+    - id: gdacs_24h
+      name: GDACS
+      url: https://www.gdacs.org/xml/rss_24h.xml
+      region: global
+      category_hint: discovery
+    - id: who_news
+      name: World Health Organization
+      url: https://www.who.int/rss-feeds/news-english.xml
+      region: global
+      category_hint: discovery
+    - id: sciencedaily_top
+      name: ScienceDaily
+      url: https://www.sciencedaily.com/rss/top/science.xml
+      region: global
+      category_hint: discovery
+    - id: bbc_science
+      name: BBC
+      url: https://feeds.bbci.co.uk/news/science_and_environment/rss.xml
+      region: global
+      category_hint: discovery
+    - id: bbc_tech
+      name: BBC
+      url: https://feeds.bbci.co.uk/news/technology/rss.xml
+      region: global
+      category_hint: discovery
+    - id: arstechnica
+      name: Ars Technica
+      url: https://feeds.arstechnica.com/arstechnica/index
+      region: global
+      category_hint: discovery
+    - id: bbc_sport
+      name: BBC
+      url: https://feeds.bbci.co.uk/sport/rss.xml
+      region: global
+      category_hint: discovery
+    - id: guardian_sport
+      name: The Guardian
+      url: https://www.theguardian.com/sport/rss
+      region: global
+      category_hint: discovery
+    - id: guardian_world
+      name: The Guardian
+      url: https://www.theguardian.com/world/rss
+      region: global
+      category_hint: discovery
+    - id: npr_world
+      name: NPR
+      url: https://feeds.npr.org/1004/rss.xml
+      region: us
+      category_hint: discovery
+    - id: cbc_world
+      name: CBC
+      url: https://www.cbc.ca/webfeed/rss/rss-world
+      region: americas
+      category_hint: discovery
+    - id: france24_en
+      name: France 24
+      url: https://www.france24.com/en/rss
+      region: eu
+      category_hint: discovery
+    - id: politico_eu
+      name: Politico Europe
+      url: https://www.politico.eu/feed/
+      region: eu
       category_hint: discovery
 structured:
   fmp_enabled: false
