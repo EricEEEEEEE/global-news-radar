@@ -46,9 +46,18 @@ class HttpClient:
         self.session.headers.update(
             {
                 "User-Agent": user_agent,
+                # A feed reader wants the feed in whatever flavour the
+                # publisher serves it. GDACS serves application/xml, which
+                # this list used to omit, and its server honours content
+                # negotiation strictly enough to answer 406 -- the disaster
+                # feed was dark from the day it was added. The catch-all
+                # keeps the next publisher with an unusual type from going
+                # the same way, at a low enough q to still express a
+                # preference for real feed types.
                 "Accept": (
                     "application/rss+xml, application/atom+xml, "
-                    "application/json, text/xml;q=0.9"
+                    "application/xml;q=0.9, text/xml;q=0.9, "
+                    "application/json;q=0.8, */*;q=0.1"
                 ),
             }
         )

@@ -39,7 +39,7 @@ from radar.render import (
     validate_html,
 )
 from radar.service import RadarService, check_health
-from radar.sources import FmpCollector, GdeltCollector, discovery_queries
+from radar.sources import FmpCollector, GdeltCollector, HttpClient, discovery_queries
 from radar.store import RadarStore
 from radar.summarizer import LlmSummarizer, Summary, bare_english_spans
 from radar.trending import TrendingJudge
@@ -4205,6 +4205,27 @@ class BriefRenderTests(unittest.TestCase):
         )
         # Telegram's own hard cap for a text message.
         self.assertLessEqual(int(CONFIG["telegram"]["max_visible_chars"]), 4096)
+
+
+class FeedAcceptHeaderTests(unittest.TestCase):
+    def test_the_reader_accepts_the_types_publishers_actually_serve(self) -> None:
+        # GDACS answers 406 to an Accept header without application/xml, so
+        # the disaster feed returned nothing from the day it was added.
+        accept = HttpClient("radar/test").session.headers["Accept"]
+        for media_type in (
+            "application/rss+xml",
+            "application/atom+xml",
+            "application/xml",
+            "text/xml",
+        ):
+            self.assertIn(media_type, accept)
+
+    def test_an_unusual_feed_type_is_not_refused_outright(self) -> None:
+        # The catch-all is what keeps the next odd publisher from going dark
+        # silently; it sits at a low q so real feed types still win.
+        accept = HttpClient("radar/test").session.headers["Accept"]
+        self.assertIn("*/*", accept)
+        self.assertLess(accept.index("application/rss+xml"), accept.index("*/*"))
 
 
 class ChaosIndexTests(unittest.TestCase):
