@@ -12,14 +12,31 @@ from pathlib import Path
 from unittest import mock
 
 from radar import __version__
+from radar import embeddings as embeddings_module
 from radar.briefs import BriefComposer
 from radar.clusters import ClusterEngine, tokenize
 from radar.comic import CATEGORY_SCENES, HARD_BANS, ComicArtist
 from radar.config import load_config
 from radar.delivery import TelegramDelivery
+from radar.domains import (
+    DOMAIN_LABELS,
+    classify_keywords,
+    classify_keywords_scored,
+    group_sections,
+    pack_by_quota,
+    resolve_domain,
+)
+from radar.embeddings import TitleEmbedder
 from radar.models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from radar.policy import assess, is_fresh, is_quiet_window, trending_assessment
-from radar.render import outbox_manifest, render_p0, render_p1, validate_html
+from radar.render import (
+    outbox_manifest,
+    render_brief,
+    render_brief_cover,
+    render_p0,
+    render_p1,
+    validate_html,
+)
 from radar.service import RadarService, check_health
 from radar.sources import FmpCollector, GdeltCollector, discovery_queries
 from radar.store import RadarStore
@@ -31,10 +48,13 @@ from radar.util import (
     canonicalize_url,
     echoable_numbers,
     hamming_distance,
+    normalize_title,
     numeric_values,
     redact_secrets,
     register_secrets,
     simhash64,
+    stable_hash,
+    strip_source_suffix,
     visible_length,
 )
 from radar.watchdog import run_watchdog
@@ -84,6 +104,13 @@ class VersionTests(unittest.TestCase):
         # report __version__. When only the config was bumped, a freshly
         # deployed build told the watchdog it was still the old one.
         self.assertEqual(CONFIG["version"], __version__)
+
+    def test_pyproject_version_stays_in_sync(self) -> None:
+        # This one drifted silently from 1.4.0 through four releases, because
+        # nothing reads it at runtime -- only whoever packages or audits the
+        # project, and by then the number is a lie.
+        text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn(f'version = "{__version__}"', text)
 
 
 class PolicyTests(unittest.TestCase):
@@ -2914,9 +2941,10 @@ class BriefComposerTests(unittest.TestCase):
         self.assertEqual(message.level, "BRIEF")
         self.assertEqual(message.event_keys, ["brief:evening:2026-07-25"])
         self.assertIn("世界晚报 · 7月25日 周六", message.plain_text)
-        self.assertIn("本时段无达到整理门槛的世界大事。", message.plain_text)
-        self.assertIn("窗口13小时 · 告警0条 · 故事簇0个", message.plain_text)
-        self.assertLessEqual(visible_length(message.html), 950)
+        self.assertIn("本时段无达到整理门槛的世界大事", message.plain_text)
+        self.assertIn("覆盖13小时", message.plain_text)
+        self.assertIn("告警0条 · 故事簇0个", message.plain_text)
+        self.assertLessEqual(visible_length(message.html), 3500)
         self.assertEqual(comic_entries, [])
 
     def test_compose_degrades_to_mechanical_line_without_llm(self) -> None:
@@ -2943,8 +2971,14 @@ class BriefComposerTests(unittest.TestCase):
         message, comic_entries = self.composer.compose(
             "evening", NOW + timedelta(hours=3)
         )
-        self.assertIn("2家大社在报", message.plain_text)
-        self.assertIn("（2家大社）", message.plain_text)
+        # No translation available, so the lead degrades to the headline and
+        # the note under it carries the corroboration and the outlets.
+        self.assertIn(
+            "Chile copper mines halt production after nationwide power failure",
+            message.plain_text,
+        )
+        # Newest major first: Bloomberg filed at 50 minutes, Reuters at 60.
+        self.assertIn("2家大社 · Bloomberg · Reuters", message.plain_text)
         self.assertEqual(len(comic_entries), 1)
         self.assertEqual(comic_entries[0][0], "brief")
 
@@ -2959,12 +2993,21 @@ class BriefComposerTests(unittest.TestCase):
                 "Chile copper mines halt production after nationwide power failure"
             ),
         }
-        clean = self.composer._gated_line("智利铜矿因全国停电停产", story)
-        self.assertEqual(clean, "智利铜矿因全国停电停产")
-        invented = self.composer._gated_line("智利3座铜矿停产", story)
-        self.assertTrue(invented.startswith("2家大社在报"))
-        bare = self.composer._gated_line("停产影响 Chile mines 出口", story)
-        self.assertTrue(bare.startswith("2家大社在报"))
+        gate = self.composer._gated
+        self.assertEqual(
+            gate("智利铜矿因全国停电停产", story, 48, "lead"), "智利铜矿因全国停电停产"
+        )
+        # A number no headline printed, an over-long line, and an unglossed
+        # English span each reject to "" so the caller falls back.
+        self.assertEqual(gate("智利3座铜矿停产", story, 48, "lead"), "")
+        self.assertEqual(gate("停产影响 Chile mines 出口", story, 48, "lead"), "")
+        self.assertEqual(gate("智利铜矿因全国停电停产", story, 6, "why"), "")
+        # "Chile" alone is name-shaped and appears in the headlines, so the
+        # relaxed gate admits it where the strict alert gate would not.
+        self.assertEqual(
+            gate("Chile 铜矿因全国停电停产", story, 48, "lead"),
+            "Chile 铜矿因全国停电停产",
+        )
 
     def test_continuity_tags_advance_across_days_only(self) -> None:
         stories: list[dict[str, object]] = [
@@ -3219,6 +3262,590 @@ class WorldSlotTests(unittest.TestCase):
     def test_gdelt_world_query_targets_disaster_and_conflict_themes(self) -> None:
         self.assertIn("theme:NATURAL_DISASTER", GdeltCollector.WORLD_QUERY)
         self.assertIn("theme:ARMEDCONFLICT", GdeltCollector.WORLD_QUERY)
+
+
+class SourceSuffixTests(unittest.TestCase):
+    def test_known_outlet_suffix_is_removed(self) -> None:
+        self.assertEqual(
+            strip_source_suffix(
+                "Chile copper mines halt production - Reuters", ("Reuters",)
+            ),
+            "Chile copper mines halt production",
+        )
+
+    def test_outlet_shaped_suffix_is_removed_without_a_known_list(self) -> None:
+        # Google News invents the suffix from whatever outlet it syndicated, so
+        # the shape has to carry the decision when the name is not configured.
+        self.assertEqual(
+            strip_source_suffix("Typhoon nears Okinawa — The Japan Times"),
+            "Typhoon nears Okinawa",
+        )
+
+    def test_sentence_tail_survives(self) -> None:
+        # A lowercase tail is prose, not a masthead. Stripping it would delete
+        # the half of the headline that says what happened.
+        headline = "Fed holds rates - what it means for mortgage borrowers"
+        self.assertEqual(strip_source_suffix(headline), headline)
+
+    def test_long_outlet_shaped_tail_survives(self) -> None:
+        headline = "Court rules - Ministry Of Justice Appeals The Decision Again"
+        self.assertEqual(strip_source_suffix(headline), headline)
+
+    def test_stripping_never_leaves_a_stub_headline(self) -> None:
+        # Better a headline with a masthead on it than a headline with no news.
+        self.assertEqual(
+            strip_source_suffix("Oil up - CNBC", ("CNBC",)), "Oil up - CNBC"
+        )
+        self.assertEqual(
+            strip_source_suffix("Quake hits Peru - CNBC", ("CNBC",)), "Quake hits Peru"
+        )
+
+    def test_simhash_is_suffix_invariant(self) -> None:
+        # This is the whole point: the same story filed by two outlets used to
+        # produce two different fingerprints because of the trailing masthead.
+        bare = "Nationwide power failure halts Chile copper production"
+        self.assertEqual(simhash64(bare), simhash64(f"{bare} - Reuters"))
+        self.assertEqual(normalize_title(f"{bare} | Bloomberg"), normalize_title(bare))
+
+
+class RssSuffixCollectionTests(unittest.TestCase):
+    FEED = (
+        '<?xml version="1.0"?><rss><channel>'
+        "<item><title>Quake hits southern Peru - Reuters</title>"
+        "<link>https://example.com/a</link><guid>a</guid>"
+        "<pubDate>Sat, 25 Jul 2026 09:30:00 GMT</pubDate></item>"
+        "</channel></rss>"
+    )
+
+    def _collect(self) -> list[NewsItem]:
+        from radar.sources import RssCollector
+
+        response = mock.Mock()
+        response.status_code = 200
+        response.headers = {}
+        response.content = self.FEED.encode("utf-8")
+        client = mock.Mock()
+        client.request.return_value = response
+        store = mock.Mock()
+        store.get_meta.return_value = None
+        collector = RssCollector(client, store)
+        return collector.collect(
+            source_id="reuters_world",
+            source_name="Reuters",
+            url="https://example.com/rss",
+            source_tier="secondary",
+            region="global",
+            category_hint="discovery",
+            now=NOW,
+        )
+
+    def test_title_is_cleaned_but_identity_is_not(self) -> None:
+        items = self._collect()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].title, "Quake hits southern Peru")
+        # Identity must still hash the raw title. If it hashed the cleaned one,
+        # the first poll after deploy would see every stored item as new and
+        # replay the whole backlog as alerts.
+        expected = stable_hash("reuters_world|a|Quake hits southern Peru - Reuters", 24)
+        self.assertEqual(items[0].identity, expected)
+
+
+class BareEnglishGlossTests(unittest.TestCase):
+    def test_unglossed_span_is_still_reported(self) -> None:
+        self.assertEqual(
+            bare_english_spans("公司 posts Q2 profit 超预期"), ["posts Q2 profit"]
+        )
+
+    def test_parenthesised_gloss_exempts_the_span(self) -> None:
+        self.assertEqual(bare_english_spans("Klarna（先买后付）提交招股书"), [])
+
+    def test_name_shaped_span_printed_by_the_headlines_is_admitted(self) -> None:
+        names = ["Klarna files for US IPO"]
+        self.assertEqual(bare_english_spans("Klarna 提交美国上市申请", names), [])
+
+    def test_verb_phrase_is_not_admitted_even_when_the_headline_printed_it(
+        self,
+    ) -> None:
+        # The relaxation is for names only. A whole English clause surviving
+        # into a Chinese brief is exactly the failure the gate exists for.
+        names = ["Klarna posts Q2 profit above estimates"]
+        self.assertEqual(
+            bare_english_spans("公司 posts Q2 profit 超预期", names),
+            ["posts Q2 profit"],
+        )
+
+    def test_alert_callers_keep_the_strict_gate(self) -> None:
+        self.assertEqual(bare_english_spans("Klarna 提交美国上市申请"), ["Klarna"])
+
+
+class DomainClassificationTests(unittest.TestCase):
+    CASES = (
+        ("Magnitude 6.1 earthquake strikes off eastern Japan", "disaster"),
+        ("Israeli strike kills three in southern Lebanon", "politics"),
+        ("Fed holds interest rates steady as inflation cools", "economy"),
+        ("Scientists find new antibiotic in deep-sea bacteria", "science"),
+        ("OpenAI releases a smaller reasoning model", "tech"),
+        ("Court sentences former mayor in corruption case", "society"),
+        ("Verstappen wins the Italian Grand Prix", "sport"),
+    )
+
+    def test_each_domain_has_a_keyword_path(self) -> None:
+        for title, expected in self.CASES:
+            with self.subTest(title=title):
+                self.assertEqual(classify_keywords(title), expected)
+
+    def test_unmatched_headline_falls_to_other(self) -> None:
+        self.assertEqual(classify_keywords("A quiet afternoon in the village"), "other")
+
+    def test_every_domain_label_is_translated(self) -> None:
+        for _title, domain in self.CASES:
+            self.assertIn(domain, DOMAIN_LABELS)
+
+
+class QuotaPackingTests(unittest.TestCase):
+    @staticmethod
+    def _stories(domains: list[str]) -> list[dict[str, object]]:
+        return [
+            {"id": index, "domain": domain, "score": 100 - index}
+            for index, domain in enumerate(domains)
+        ]
+
+    def test_quota_stops_one_domain_owning_the_brief(self) -> None:
+        stories = self._stories(["economy"] * 6 + ["disaster", "sport"])
+        packed = pack_by_quota(stories, {"economy": 2, "disaster": 2, "sport": 1}, 4)
+        self.assertEqual(
+            [str(entry["domain"]) for entry in packed],
+            ["economy", "economy", "disaster", "sport"],
+        )
+
+    def test_quiet_day_gives_unused_slots_back_to_the_ranking(self) -> None:
+        # Four candidates, three of them economy, ten slots: the second pass
+        # must ignore the cap rather than ship a one-line brief.
+        stories = self._stories(["economy", "economy", "economy", "sport"])
+        packed = pack_by_quota(stories, {"economy": 1, "sport": 1}, 10)
+        self.assertEqual(len(packed), 4)
+        self.assertEqual([int(entry["id"]) for entry in packed], [0, 3, 1, 2])
+
+    def test_missing_domain_quota_defaults_to_one(self) -> None:
+        stories = self._stories(["tech", "tech"])
+        self.assertEqual(len(pack_by_quota(stories, {}, 1)), 1)
+
+    def test_sections_lead_with_the_biggest_story(self) -> None:
+        stories = self._stories(["sport", "disaster", "sport"])
+        stories[1]["score"] = 500
+        sections = group_sections(stories)
+        self.assertEqual([name for name, _ in sections], ["disaster", "sport"])
+        self.assertEqual(len(sections[1][1]), 2)
+
+    def test_equal_sections_fall_back_to_the_reading_order(self) -> None:
+        stories = self._stories(["sport", "politics"])
+        for story in stories:
+            story["score"] = 10
+        self.assertEqual(
+            [name for name, _ in group_sections(stories)], ["politics", "sport"]
+        )
+
+
+class SourceHintDomainTests(unittest.TestCase):
+    HINTS = {
+        "bbc_sport": "sport",
+        "guardian_sport": "sport",
+        "usgs_quakes": "disaster",
+        "arstechnica": "tech",
+    }
+
+    def test_hint_rescues_a_headline_with_no_domain_vocabulary(self) -> None:
+        # The measured failure: real sport copy names teams and players, not
+        # sports, so keywords alone return "other" for most of a sport feed.
+        title = "Chelsea happy with Fernandez, says Alonso"
+        self.assertEqual(classify_keywords(title), "other")
+        self.assertEqual(resolve_domain(title, ["bbc_sport"], self.HINTS), "sport")
+
+    def test_hint_beats_a_single_accidental_cue(self) -> None:
+        title = "Can Sabalenka find a way to repair her collapsed form?"
+        self.assertEqual(classify_keywords(title), "disaster")
+        self.assertEqual(resolve_domain(title, ["guardian_sport"], self.HINTS), "sport")
+
+    def test_evidenced_keywords_beat_the_hint(self) -> None:
+        # A stadium disaster filed by a sport desk is still a disaster.
+        title = "Earthquake collapses stadium roof, rescuers search rubble"
+        self.assertGreaterEqual(classify_keywords_scored(title)[1], 2)
+        self.assertEqual(resolve_domain(title, ["bbc_sport"], self.HINTS), "disaster")
+
+    def test_unhinted_sources_leave_the_keyword_result_alone(self) -> None:
+        title = "Chelsea happy with Fernandez, says Alonso"
+        self.assertEqual(resolve_domain(title, ["bbc_world"], self.HINTS), "other")
+
+    def test_every_configured_hint_names_a_real_feed_and_domain(self) -> None:
+        hints = CONFIG["domains"]["source_hints"]
+        feed_ids = {str(feed["id"]) for feed in CONFIG["discovery"]["feeds"]}
+        for source_id, domain in hints.items():
+            with self.subTest(source_id=source_id):
+                self.assertIn(source_id, feed_ids)
+                self.assertIn(domain, DOMAIN_LABELS)
+
+    def test_every_configured_quota_names_a_real_domain(self) -> None:
+        for domain in CONFIG["domains"]["quotas"]:
+            self.assertIn(domain, DOMAIN_LABELS)
+
+
+class ClusterTokenHygieneTests(unittest.TestCase):
+    def test_homonym_verbs_are_not_content_tokens(self) -> None:
+        # "strike" is a labour action and a military attack and what a quake
+        # does to a coastline. Three unrelated stories used to merge on it.
+        self.assertNotIn("strike", tokenize("Israeli strike kills three"))
+        self.assertNotIn("strikes", tokenize("Quake strikes off eastern Japan"))
+        self.assertNotIn("hits", tokenize("Typhoon hits Okinawa"))
+
+    def test_outlet_names_are_not_content_tokens(self) -> None:
+        self.assertNotIn("reuters", tokenize("Chile mines halt output Reuters"))
+        self.assertNotIn("bloomberg", tokenize("Fed holds rates Bloomberg"))
+
+    def test_real_subjects_survive(self) -> None:
+        tokens = tokenize("Israeli strike kills three in southern Lebanon")
+        self.assertIn("israeli", tokens)
+        self.assertIn("lebanon", tokens)
+
+    def test_a_media_name_that_is_also_a_place_survives(self) -> None:
+        # Deriving the stop list from major_sources would delete "china",
+        # "post" and "times" as content, because one outlet is called the
+        # South China Morning Post.
+        self.assertIn("china", tokenize("China Morning trade talks resume"))
+
+
+class ClusterRescueTests(unittest.TestCase):
+    class _Embedder:
+        available = True
+
+        def __init__(self, pairs: dict[tuple[str, str], float]):
+            self.pairs = pairs
+            self.threshold = 0.7
+
+        def similarity(self, left: str, right: str) -> float | None:
+            return self.pairs.get((left, right), self.pairs.get((right, left)))
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+
+    def _engine(self, embedder: object | None = None) -> ClusterEngine:
+        return ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg"],
+            embedder=embedder,
+        )
+
+    @staticmethod
+    def _filing(identity: str, source: str, title: str, minutes_old: int) -> NewsItem:
+        return item(
+            title,
+            identity=identity,
+            source=source,
+            source_tier="secondary",
+            minutes_old=minutes_old,
+        )
+
+    def test_drifted_cluster_still_matches_its_founding_headline(self) -> None:
+        # The cluster's token set is the union of everything filed into it, so
+        # a long-running story drifts away from what it started as. Matching
+        # the founding headline as well keeps a late filing from opening a
+        # duplicate cluster for the story it obviously belongs to.
+        engine = self._engine()
+        first = engine.add(
+            self._filing(
+                "d1", "Reuters", "Chile copper mines halt nationwide production", 90
+            ),
+            NOW,
+        )
+        engine.add(
+            self._filing(
+                "d2",
+                "Bloomberg",
+                "Chile copper mines halt nationwide production as grid fails",
+                80,
+            ),
+            NOW,
+        )
+        late = engine.add(
+            self._filing(
+                "d3", "Reuters", "Chile copper production halt enters second day", 10
+            ),
+            NOW,
+        )
+        self.assertEqual(late, first)
+
+    def test_embedding_rescues_a_restatement_with_no_shared_tokens(self) -> None:
+        pair = (
+            "Seoul warns Pyongyang over border incident",
+            "South Korea protests North Korean incursion",
+        )
+        engine = self._engine(self._Embedder({pair: 0.91}))
+        first = engine.add(self._filing("e1", "Reuters", pair[0], 60), NOW)
+        second = engine.add(self._filing("e2", "Bloomberg", pair[1], 50), NOW)
+        self.assertEqual(second, first)
+
+    def test_without_an_embedder_the_same_pair_stays_apart(self) -> None:
+        engine = self._engine()
+        first = engine.add(
+            self._filing(
+                "n1", "Reuters", "Seoul warns Pyongyang over border incident", 60
+            ),
+            NOW,
+        )
+        second = engine.add(
+            self._filing(
+                "n2", "Bloomberg", "South Korea protests North Korean incursion", 50
+            ),
+            NOW,
+        )
+        self.assertNotEqual(second, first)
+
+    def test_representative_is_the_most_informative_filing(self) -> None:
+        engine = self._engine()
+        engine.add(self._filing("r1", "Reuters", "Strong quake strikes Japan", 90), NOW)
+        engine.add(
+            self._filing(
+                "r2",
+                "Bloomberg",
+                "Strong quake strikes northern Japan, tsunami advisory issued",
+                80,
+            ),
+            NOW,
+        )
+        stories = engine.top_clusters(
+            NOW - timedelta(hours=6), NOW + timedelta(hours=1), limit=5
+        )
+        self.assertEqual(len(stories), 1)
+        self.assertIn("tsunami advisory", str(stories[0]["rep_title"]))
+
+    def test_top_clusters_report_their_feeds_and_score(self) -> None:
+        engine = self._engine()
+        engine.add(self._filing("s1", "Reuters", "Strong quake strikes Japan", 90), NOW)
+        engine.add(
+            self._filing("s2", "Bloomberg", "Strong quake strikes Japan coast", 80), NOW
+        )
+        story = engine.top_clusters(
+            NOW - timedelta(hours=6), NOW + timedelta(hours=1), limit=5
+        )[0]
+        self.assertEqual(story["source_ids"], ["bloomberg", "reuters"])
+        self.assertEqual(int(story["score"]), 2 * 3 + 2)
+        self.assertEqual(
+            [name for name, _url in story["sources"]], ["Bloomberg", "Reuters"]
+        )
+
+
+class TitleEmbedderTests(unittest.TestCase):
+    def test_disabled_embedder_is_inert(self) -> None:
+        embedder = TitleEmbedder(enabled=False, model_name="", threshold=0.7)
+        self.assertFalse(embedder.available)
+        self.assertIsNone(embedder.similarity("a quake", "an earthquake"))
+
+    def test_a_missing_dependency_degrades_instead_of_raising(self) -> None:
+        # The VPS may not have model2vec installed. Clustering must fall back
+        # to token overlap rather than take the daemon down with an ImportError.
+        embedder = TitleEmbedder(
+            enabled=True, model_name="definitely/not-a-real-model", threshold=0.7
+        )
+        with mock.patch.dict(sys.modules, {"model2vec": None}):
+            self.assertFalse(embedder.available)
+            self.assertIsNone(embedder.similarity("a quake", "an earthquake"))
+
+    def test_the_same_model_is_only_loaded_once_per_process(self) -> None:
+        # Every RadarService builds an embedder. Without the cache the unit
+        # suite alone loaded the table dozens of times and took 13x longer.
+        loads = []
+
+        def counted(self):  # noqa: ANN001
+            loads.append(self.model_name)
+            return object()
+
+        with mock.patch.dict(embeddings_module._MODELS, {}, clear=True):
+            with mock.patch.object(TitleEmbedder, "_load_uncached", counted):
+                for _ in range(3):
+                    TitleEmbedder(enabled=True, model_name="x/y", threshold=0.7)
+        self.assertEqual(loads, ["x/y"])
+
+
+def _section(label: str, *leads: str) -> dict[str, object]:
+    return {
+        "emoji": "🌋",
+        "label": label,
+        "items": [
+            {
+                "lead": lead,
+                "note": "2家大社",
+                "sources": [("Reuters", "https://example.com/a")],
+            }
+            for lead in leads
+        ],
+    }
+
+
+class BriefRenderTests(unittest.TestCase):
+    def _render(self, sections, replayed=(), limit=3500):
+        return render_brief(
+            header="世界晚报 · 7月25日 周六",
+            subtitle="混乱指数 42/100 · 正常 · 覆盖13小时",
+            sections=list(sections),
+            replayed=list(replayed),
+            footer="告警2条 · 故事簇9个 · 候选30个",
+            event_key="brief:evening:2026-07-25",
+            now=NOW,
+            max_visible_chars=limit,
+        )
+
+    def test_sections_are_labelled_and_stories_lead_in_bold(self) -> None:
+        message = self._render(
+            [
+                _section("天灾与事故", "日本东北近海6.1级地震"),
+                _section("体育", "红牛续约维斯塔潘"),
+            ]
+        )
+        self.assertIn("🌋 <b>天灾与事故</b>", message.html)
+        self.assertIn("<b>日本东北近海6.1级地震</b>", message.html)
+        self.assertIn("🌋 <b>体育</b>", message.html)
+        # Attribution is a link, and links cost nothing against the counter.
+        self.assertIn('<a href="https://example.com/a">Reuters</a>', message.html)
+        self.assertEqual(message.level, "BRIEF")
+        self.assertEqual(message.event_keys, ["brief:evening:2026-07-25"])
+        validate_html(message.html, 4000)
+
+    def test_replayed_alerts_are_dropped_before_any_story(self) -> None:
+        sections = [
+            _section("天灾与事故", "日本东北近海6.1级地震", "智利铜矿全国停电停产")
+        ]
+        # 125 fits the header, one story and the footer, but not the replay.
+        message = self._render(
+            sections, replayed=["已推的一条很长的提醒" * 6], limit=125
+        )
+        self.assertNotIn("已推提醒", message.plain_text)
+        self.assertIn("日本东北近海6.1级地震", message.plain_text)
+
+    def test_trailing_stories_go_before_earlier_ones(self) -> None:
+        sections = [
+            _section("天灾与事故", "日本东北近海6.1级地震"),
+            _section("体育", "红牛续约维斯塔潘"),
+        ]
+        # 130 fits one story; the second section cannot survive.
+        message = self._render(sections, limit=130)
+        self.assertIn("日本东北近海6.1级地震", message.plain_text)
+        self.assertNotIn("红牛续约维斯塔潘", message.plain_text)
+        # An emptied section takes its own heading with it.
+        self.assertNotIn("体育", message.plain_text)
+
+    def test_a_lone_oversized_lead_is_clipped_not_dropped(self) -> None:
+        message = self._render([_section("天灾与事故", "地" * 400)], limit=150)
+        self.assertLessEqual(visible_length(message.html), 150)
+        self.assertIn("地地地", message.plain_text)
+
+    def test_empty_brief_still_says_so(self) -> None:
+        message = self._render([])
+        self.assertIn("本时段无达到整理门槛的世界大事", message.plain_text)
+        self.assertIn("告警2条", message.plain_text)
+
+    def test_cover_caption_fits_a_photo_and_names_the_day(self) -> None:
+        cover = render_brief_cover(
+            header="世界晚报 · 7月25日 周六",
+            event_key="brief-cover:evening:2026-07-25",
+            now=NOW,
+            max_visible_chars=400,
+        )
+        self.assertIn("世界晚报 · 7月25日 周六", cover.plain_text)
+        self.assertEqual(cover.event_keys, ["brief-cover:evening:2026-07-25"])
+        # The whole point of splitting it out: a caption must clear 1024.
+        self.assertLessEqual(visible_length(cover.html), 1024)
+        validate_html(cover.html, 1024)
+
+    def test_config_brief_budget_fits_under_the_delivery_ceiling(self) -> None:
+        self.assertLessEqual(
+            int(CONFIG["briefs"]["max_visible_chars"]),
+            int(CONFIG["telegram"]["max_visible_chars"]),
+        )
+        # Telegram's own hard cap for a text message.
+        self.assertLessEqual(int(CONFIG["telegram"]["max_visible_chars"]), 4096)
+
+
+class ChaosIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+        engine = ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg"],
+        )
+        self.composer = BriefComposer(
+            store=self.store,
+            engine=engine,
+            base_url="",
+            api_key="",
+            model="",
+            timeout=5,
+            max_items=10,
+            max_visible_chars=3500,
+            morning_sgt="07:30",
+            evening_sgt="20:30",
+        )
+
+    @staticmethod
+    def _stories(count: int, domain: str, majors: int) -> list[dict[str, object]]:
+        return [
+            {"domain": domain, "major_count": majors, "member_count": majors}
+            for _ in range(count)
+        ]
+
+    def test_a_quiet_window_scores_zero(self) -> None:
+        index, verdict = self.composer._chaos_index(NOW, [], [])
+        self.assertEqual(index, 0)
+        self.assertEqual(verdict, "基线建立中")
+
+    def test_conflict_and_corroboration_raise_the_index(self) -> None:
+        calm, _ = self.composer._chaos_index(NOW, [], self._stories(4, "economy", 1))
+        loud, _ = self.composer._chaos_index(
+            NOW, ["a"] * 8, self._stories(4, "disaster", 6)
+        )
+        self.assertLess(calm, loud)
+        self.assertEqual(loud, 100)
+
+    def test_the_band_is_relative_to_this_radar_not_an_absolute_scale(self) -> None:
+        self.store.set_meta("brief_chaos_history", json.dumps([20] * 10), NOW)
+        _index, verdict = self.composer._chaos_index(
+            NOW, ["a"] * 8, self._stories(4, "disaster", 6)
+        )
+        self.assertEqual(verdict, "偏高")
+        self.store.set_meta("brief_chaos_history", json.dumps([90] * 10), NOW)
+        _index, verdict = self.composer._chaos_index(NOW, [], [])
+        self.assertEqual(verdict, "偏低")
+
+    def test_history_is_bounded(self) -> None:
+        self.store.set_meta("brief_chaos_history", json.dumps(list(range(80))), NOW)
+        self.composer._chaos_index(NOW, [], [])
+        stored = json.loads(str(self.store.get_meta("brief_chaos_history")))
+        self.assertEqual(len(stored), 30)
+
+    def test_corrupt_history_does_not_break_the_brief(self) -> None:
+        self.store.set_meta("brief_chaos_history", "{not json", NOW)
+        index, verdict = self.composer._chaos_index(NOW, [], [])
+        self.assertEqual((index, verdict), (0, "基线建立中"))
+
+    def test_yesterdays_leads_are_remembered_for_continuity(self) -> None:
+        self.composer._remember_leads(NOW, ["智利铜矿停产", "日本地震"])
+        self.assertEqual(self.composer._previous_leads(), ["智利铜矿停产", "日本地震"])
+
+    def test_corrupt_lead_memory_degrades_to_no_continuity(self) -> None:
+        self.store.set_meta("brief_previous_leads", "{not json", NOW)
+        self.assertEqual(self.composer._previous_leads(), [])
 
 
 if __name__ == "__main__":
