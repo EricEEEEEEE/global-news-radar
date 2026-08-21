@@ -1892,6 +1892,31 @@ class NumberGuardTests(unittest.TestCase):
     def test_quarter_label_may_become_a_digit(self) -> None:
         self.assertIn("2", echoable_numbers("Q2 revenue beat"))
 
+    def test_spelled_out_cardinal_may_become_a_digit(self) -> None:
+        # The brief printed a raw English headline over this: the line 杀害5人
+        # is a faithful rendering of "killing five", but the digit appeared
+        # nowhere in the source and the gate called it invented.
+        source = (
+            "Japan executes 58-year-old man convicted of killing five "
+            "in 2009 Osaka pachinko parlor arson"
+        )
+        allowed = echoable_numbers(source)
+        self.assertTrue(numeric_values("该男子被控杀害5人") <= allowed)
+        self.assertFalse(numeric_values("该男子被控杀害7人") <= allowed)
+
+    def test_plain_number_may_be_regrouped_into_chinese_units(self) -> None:
+        # Chinese groups digits in ten-thousands: 70,000 doses is 7万剂. The
+        # existing rescaling only covered English scale words, so a source
+        # that spelled the number out in full still tripped the gate.
+        source = "70,000 Ebola vaccines released to DRC as outbreak persists"
+        allowed = echoable_numbers(source)
+        self.assertTrue(numeric_values("刚果将获7万剂疫苗") <= allowed)
+        self.assertFalse(numeric_values("刚果将获9万剂疫苗") <= allowed)
+
+    def test_regrouping_does_not_widen_small_numbers(self) -> None:
+        # 58 is not written with a 万 unit, so 0.0058 must not become echoable.
+        self.assertNotIn("0.0058", echoable_numbers("a 58-year-old man"))
+
     def test_iso_date_does_not_leak_a_negative_month(self) -> None:
         self.assertNotIn("-8", numeric_values("2026-08-03T12:00:00+08:00"))
 
@@ -2982,6 +3007,42 @@ class BriefComposerTests(unittest.TestCase):
         self.assertIn("2家大社 · Bloomberg · Reuters", message.plain_text)
         self.assertEqual(len(comic_entries), 1)
         self.assertEqual(comic_entries[0][0], "brief")
+
+    def test_two_clusters_that_translate_to_one_sentence_print_once(self) -> None:
+        # Yonhap files the same despatch as (URGENT) and again as (LEAD). The
+        # two can land in separate clusters and still translate to the same
+        # Chinese sentence, which would spend two of ten slots saying one
+        # thing.
+        self.engine.add(
+            item(
+                "Seoul scales back Ulchi Freedom Shield drills",
+                identity="dup-a",
+                source="Reuters",
+                source_tier="secondary",
+                minutes_old=60,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            item(
+                "North Korea calls reduced allied exercises a poor decision",
+                identity="dup-b",
+                source="Bloomberg",
+                source_tier="secondary",
+                minutes_old=50,
+            ),
+            NOW,
+        )
+        line = "首尔缩减乙支自由护盾演习"
+        self.composer._translate = lambda stories, previous: [  # type: ignore[method-assign]
+            {"lead": line, "why": ""} for _ in stories
+        ]
+        message, comic_entries = self.composer.compose(
+            "evening", NOW + timedelta(hours=3)
+        )
+        self.assertEqual(message.plain_text.count(line), 1)
+        self.assertEqual(len(comic_entries), 1)
+        self.assertIn("故事簇1个", message.plain_text)
 
     def test_gated_line_rejects_invented_numbers_and_bare_english(self) -> None:
         story: dict[str, object] = {

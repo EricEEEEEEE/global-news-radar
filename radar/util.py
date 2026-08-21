@@ -285,6 +285,50 @@ _SCALE_FACTORS = {
 }
 
 
+# Cardinals an English headline spells out where Chinese writes the digit:
+# "killing five in a 2009 arson" is faithfully rendered 杀害5人, and a
+# byte-level comparison sees 5 as invented. Ordinals are left out on purpose --
+# "third quarter" is 第3季度, but "third" as a rank is not a count.
+_WORD_NUMBERS = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "dozen": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+}
+
+# Chinese groups digits in ten-thousands, so a plain source number is written
+# with a 万 or 亿 unit and the digits themselves change: 70,000 vaccines is
+# 7万剂, 150,000 is 15万. The reverse direction (an English scale word) is
+# already handled by _SCALE_FACTORS; this is the case where the source spells
+# the number out in full and only the translation carries a unit.
+_CN_GROUPINGS = (Decimal(10000), Decimal(100000000))
+
+
 def echoable_numbers(value: str) -> set[str]:
     """Numbers a faithful translation may contain, given this source text.
 
@@ -301,6 +345,17 @@ def echoable_numbers(value: str) -> set[str]:
     for name, number in _MONTH_NUMBERS.items():
         if re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", lowered):
             allowed.add(number)
+    for name, number in _WORD_NUMBERS.items():
+        if re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", lowered):
+            allowed.add(number)
+    for token in list(allowed):
+        try:
+            base = Decimal(token)
+        except InvalidOperation:
+            continue
+        for grouping in _CN_GROUPINGS:
+            if base >= grouping:
+                allowed.add(format((base / grouping).normalize(), "f"))
     for match in _SCALE_RE.finditer(value or ""):
         try:
             base = Decimal(match.group(1).replace(",", "").lstrip("+"))

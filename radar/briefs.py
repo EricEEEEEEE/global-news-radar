@@ -215,6 +215,8 @@ class BriefComposer:
         written = self._translate(stories, self._previous_leads())
 
         leads: list[str] = []
+        kept: list[dict[str, object]] = []
+        seen_leads: set[str] = set()
         for index, story in enumerate(stories):
             entry = written[index] if index < len(written) else {}
             lead = self._gated(
@@ -229,9 +231,22 @@ class BriefComposer:
             if tag:
                 meta_parts.append(tag)
             note = " · ".join(part for part in [why, *meta_parts] if part)
+            # Two clusters can be one story -- Yonhap files the same
+            # despatch as (URGENT) and again as (LEAD), and they land in
+            # separate clusters -- and once translated they become the same
+            # Chinese sentence. Printing it twice in a ten-line brief costs a
+            # slot and reads as a bug, so the lower-ranked one is dropped.
+            if lead in seen_leads:
+                LOGGER.info(
+                    "brief_duplicate_lead cluster=%s lead=%s", story.get("id"), lead
+                )
+                continue
+            seen_leads.add(lead)
             story["lead"] = lead
             story["note"] = note
+            kept.append(story)
             leads.append(lead)
+        stories = kept
 
         sections = [
             {
