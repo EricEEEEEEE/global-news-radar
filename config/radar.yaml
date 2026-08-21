@@ -123,9 +123,16 @@ briefs:
 # Classification is keyword-first and deterministic; the LLM pass, when enabled,
 # may only override with a label from this same list and fails open to keywords.
 domains:
-  llm_enabled: false
-  model: ""
-  timeout_seconds: 30
+  # Keywords cannot classify sport: what marks a headline as sport is usually a
+  # team or a player name, an unbounded set -- 55 hand-written cues caught only
+  # 18 of 48 live sport headlines. grok-3-mini reads "Arsenal beat Chelsea to
+  # reach the cup final" as sport without being told who Arsenal are. One call
+  # per brief, twice a day. It can only overrule the keyword label, never
+  # invent one: an unknown word, a short answer or an outage keeps the floor.
+  # 60s because 50 candidates measured 21s on the VPS gateway.
+  llm_enabled: true
+  model: grok-3-mini
+  timeout_seconds: 60
   quotas:
     disaster: 2
     politics: 3

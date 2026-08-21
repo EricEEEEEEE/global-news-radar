@@ -455,7 +455,11 @@ class DomainClassifier:
             json={
                 "model": self.model,
                 "temperature": 0.0,
-                "max_tokens": 600,
+                # One label per candidate, and the pool is candidate_multiplier
+                # x max_items. 600 truncated the answer at 50 titles, and a
+                # truncated answer is unparseable JSON -- the whole batch then
+                # falls back to keywords, silently.
+                "max_tokens": 1200,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": "你是新闻分类器。只输出 JSON。"},
