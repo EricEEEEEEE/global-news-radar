@@ -81,6 +81,23 @@ trending:
 clusters:
   window_hours: 12
   min_shared_tokens: 3
+  # Shared tokens are not equally identifying, so a count of them is the wrong
+  # test. Two headlines must share this much *identity* before they are one
+  # story, measured in wholly distinctive words: a word no other headline uses
+  # counts 1.0, a word half the corpus uses counts near 0. Measured on 14135
+  # stored headlines: the join that built a 300-member cluster out of every
+  # earnings story of the week shared {earnings, transcript, 2026} and carried
+  # 1.05; two outlets on the same story carry 1.65 and up. Replaying the real
+  # ingestion stream, this setting cuts the share of items sitting in 50+
+  # member buckets from 29.6% to 5.3% and the largest bucket from 532 to 142,
+  # while three-major consensus stories hold at 22 against today's 29 -- and
+  # those 29 counted the same Indonesia quake six times. Raising this splits
+  # stories, lowering it merges genres. Set to 0 to disable, which restores
+  # the count-only rule.
+  min_shared_idf: 1.65
+  # How long a cluster may keep recruiting, measured from its founding rather
+  # than its last join -- see the comment in ClusterEngine.add.
+  max_age_hours: 48
   burst_min_majors: 3
   burst_window_minutes: 90
   # Second-chance merge for the same story written in different words, e.g.

@@ -74,6 +74,12 @@ def _shorten(text: str, limit: int) -> str:
     return cleaned[: limit - 1].rstrip() + "…"
 
 
+def _lead_titles(story: dict[str, object]) -> list[str]:
+    """The member headlines the writer is shown, representative first."""
+    ordered = story.get("lead_titles") or story.get("titles") or []
+    return [str(title) for title in ordered]  # type: ignore[union-attr]
+
+
 def _utc_iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
@@ -428,7 +434,7 @@ class BriefComposer:
         payload = [
             {
                 "index": index,
-                "titles": [str(title) for title in story["titles"]][:5],  # type: ignore[index]
+                "titles": _lead_titles(story)[:5],
             }
             for index, story in enumerate(stories)
         ]

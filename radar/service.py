@@ -179,6 +179,8 @@ class RadarService:
                 str(value) for value in config["discovery"]["major_sources"]
             ],
             embedder=self.embedder,
+            min_shared_idf=float(clusters_config.get("min_shared_idf") or 0.0),
+            max_age_hours=int(clusters_config.get("max_age_hours") or 48),
         )
         briefs_config = dict(config.get("briefs") or {})
         domains_config = dict(config.get("domains") or {})

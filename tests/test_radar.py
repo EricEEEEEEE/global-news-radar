@@ -13,7 +13,7 @@ from unittest import mock
 
 from radar import __version__
 from radar import embeddings as embeddings_module
-from radar.briefs import BriefComposer
+from radar.briefs import BriefComposer, _lead_titles
 from radar.clusters import ClusterEngine, tokenize
 from radar.comic import CATEGORY_SCENES, HARD_BANS, ComicArtist
 from radar.config import load_config
@@ -3505,6 +3505,276 @@ class DomainOverlayGateTests(unittest.TestCase):
             DomainClassifier, "_ask", side_effect=RuntimeError("gateway down")
         ):
             self.assertEqual(classifier.classify(titles), ["disaster", "economy"])
+
+
+class StoryIdentityTests(unittest.TestCase):
+    """The gate that separates a story from the genre it belongs to."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+
+    def _engine(self, *, min_shared_idf: float = 1.65) -> ClusterEngine:
+        return ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg"],
+            min_shared_idf=min_shared_idf,
+        )
+
+    def _seed_corpus(self, count: int = 600) -> None:
+        """Enough headlines for document frequency to mean something.
+
+        Half of them are the earnings-transcript genre, so its vocabulary
+        becomes common exactly as it is in production, while each company
+        name stays rare.
+        """
+        rows = []
+        for index in range(count):
+            if index % 2 == 0:
+                title = (
+                    f"Earnings call transcript: Company{index} posts "
+                    f"strong H2 2026 results as costs bite"
+                )
+            else:
+                title = (
+                    f"Regulator opens inquiry into Subject{index} over "
+                    f"disclosure practices"
+                )
+            rows.append((f"seed-{index}", title, NOW.isoformat()))
+        self.store.connection.executemany(
+            "INSERT OR IGNORE INTO cluster_member "
+            "(item_identity, cluster_id, source, is_major, title, url, "
+            "published_at, added_at, item_json) "
+            "VALUES (?, -1, 'Seed', 0, ?, '', ?, ?, '{}')",
+            [(identity, title, added, added) for identity, title, added in rows],
+        )
+        self.store.connection.commit()
+
+    def _filing(self, identity: str, title: str) -> NewsItem:
+        return item(identity=identity, title=title, source="Reuters", minutes_old=5)
+
+    # Two different companies, three shared tokens: {earnings, transcript,
+    # 2026}. Under a count-only rule this is a match, and in production it
+    # built one cluster holding 300 unrelated earnings stories.
+    _GENRE_A = (
+        "Earnings call transcript: Freightways posts strong H2 2026 "
+        "results as fuel costs bite"
+    )
+    _GENRE_B = (
+        "Earnings call transcript: Iress lifts profit outlook in H1 2026 "
+        "as revenue slows"
+    )
+
+    def test_a_shared_genre_is_not_a_shared_story(self) -> None:
+        self._seed_corpus()
+        engine = self._engine()
+        first = engine.add(self._filing("genre-a", self._GENRE_A), NOW)
+        second = engine.add(self._filing("genre-b", self._GENRE_B), NOW)
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
+    def test_the_same_company_is_the_same_story(self) -> None:
+        # Same genre words, but now the rare name is shared too, which is the
+        # difference between a genre and a story.
+        self._seed_corpus()
+        engine = self._engine()
+        first = engine.add(self._filing("same-a", self._GENRE_A), NOW)
+        second = engine.add(
+            self._filing(
+                "same-b",
+                "Earnings call transcript: Freightways lifts H2 2026 outlook "
+                "after fuel costs ease",
+            ),
+            NOW,
+        )
+        self.assertEqual(first, second)
+
+    def test_disabling_the_gate_restores_the_count_only_rule(self) -> None:
+        self._seed_corpus()
+        engine = self._engine(min_shared_idf=0.0)
+        first = engine.add(self._filing("off-a", self._GENRE_A), NOW)
+        second = engine.add(self._filing("off-b", self._GENRE_B), NOW)
+        self.assertEqual(first, second)
+
+    def test_a_cold_database_has_no_opinion_and_clusters_as_before(self) -> None:
+        # No corpus seeded: frequencies are unknowable, so the gate stays open
+        # rather than guessing. A fresh deployment behaves as it always did.
+        engine = self._engine()
+        first = engine.add(self._filing("cold-a", self._GENRE_A), NOW)
+        second = engine.add(self._filing("cold-b", self._GENRE_B), NOW)
+        self.assertEqual(first, second)
+
+
+class ClusterAgeTests(unittest.TestCase):
+    """A cluster may not renew its own lease forever by absorbing."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+
+    def _engine(self, max_age_hours: int) -> ClusterEngine:
+        return ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters"],
+            max_age_hours=max_age_hours,
+        )
+
+    @staticmethod
+    def _filing(identity: str, title: str) -> NewsItem:
+        return item(identity=identity, title=title, source="Reuters", minutes_old=5)
+
+    _HEAD = "Antarctic ice shelf shows record seasonal retreat"
+    _AGAIN = "Record seasonal retreat confirmed at Antarctic ice shelf"
+
+    def test_a_cluster_kept_alive_by_joins_still_ages_out(self) -> None:
+        # last_at is refreshed at hour 10, so the activity window alone would
+        # keep this cluster recruiting indefinitely. Age is measured from the
+        # founding, so at hour 20 it is retired even though it was active ten
+        # hours ago.
+        engine = self._engine(max_age_hours=12)
+        founded = engine.add(self._filing("age-1", self._HEAD), NOW)
+        engine.add(self._filing("age-2", self._AGAIN), NOW + timedelta(hours=10))
+        later = engine.add(
+            self._filing("age-3", self._HEAD + " again"), NOW + timedelta(hours=20)
+        )
+        self.assertIsNotNone(founded)
+        self.assertNotEqual(founded, later)
+
+    def test_a_story_within_its_lifetime_still_gathers_filings(self) -> None:
+        # The same three filings on the same timeline as the test above. The
+        # only difference is the lifetime, so this pair isolates the new rule:
+        # at 12 hours the third filing starts a new cluster, at 48 it joins.
+        engine = self._engine(max_age_hours=48)
+        founded = engine.add(self._filing("live-1", self._HEAD), NOW)
+        engine.add(self._filing("live-2", self._AGAIN), NOW + timedelta(hours=10))
+        later = engine.add(
+            self._filing("live-3", self._HEAD + " again"), NOW + timedelta(hours=20)
+        )
+        self.assertEqual(founded, later)
+
+
+class MemberScoreCapTests(unittest.TestCase):
+    """Sheer volume is spammable; distinct majors are not."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+        self.engine = ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters", "Bloomberg", "BBC", "CNBC"],
+        )
+
+    def _cluster(self, title: str, sources: list[str], prefix: str) -> None:
+        for index, source in enumerate(sources):
+            self.engine.add(
+                item(
+                    title=f"{title} filing {index}",
+                    identity=f"{prefix}-{index}",
+                    source=source,
+                    source_tier="secondary",
+                    minutes_old=5,
+                ),
+                NOW,
+            )
+
+    def test_a_bot_feed_cannot_outrank_a_four_major_story(self) -> None:
+        # A seismograph bot files eighty near-identical lines and no major
+        # touches them; a real story carries four majors and a dozen filings.
+        self._cluster(
+            "Weak tremor recorded near remote monitoring station",
+            ["Volcano Discovery"] * 80,
+            "bot",
+        )
+        self._cluster(
+            "Treasury doubles debt buybacks to steady bond market",
+            ["Reuters", "Bloomberg", "BBC", "CNBC"] * 3,
+            "real",
+        )
+        ranked = self.engine.top_clusters(
+            NOW - timedelta(hours=6), NOW + timedelta(hours=6), 5
+        )
+        self.assertTrue(ranked)
+        self.assertIn("Treasury", str(ranked[0]["rep_title"]))
+        self.assertLessEqual(int(ranked[0]["score"]), 4 * 3 + 12)
+
+
+class LeadTitleTests(unittest.TestCase):
+    """The writer must be shown the story the entry is about."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = RadarStore(Path(directory.name) / "radar.sqlite3")
+        self.addCleanup(self.store.close)
+        self.engine = ClusterEngine(
+            self.store,
+            window_hours=12,
+            min_shared_tokens=3,
+            burst_min_majors=3,
+            burst_window_minutes=90,
+            major_sources=["Reuters"],
+        )
+
+    def test_the_representative_leads_what_the_writer_sees(self) -> None:
+        # The earliest filing is the thinnest one. Ordered by publication time
+        # it comes first, and a brief that hands the writer the first five
+        # describes the wire snap while linking the representative's sources.
+        self.engine.add(
+            item(
+                title="Quake off Flores island region",
+                identity="thin",
+                source="Wire Desk",
+                source_tier="secondary",
+                minutes_old=300,
+            ),
+            NOW,
+        )
+        self.engine.add(
+            item(
+                title=(
+                    "Magnitude 7.7 quake off Flores island region topples "
+                    "buildings killing at least 54 people"
+                ),
+                identity="full",
+                source="Reuters",
+                source_tier="secondary",
+                minutes_old=30,
+            ),
+            NOW,
+        )
+        story = self.engine.top_clusters(
+            NOW - timedelta(hours=12), NOW + timedelta(hours=1), 5
+        )[0]
+        titles = [str(value) for value in story["titles"]]
+        leads = [str(value) for value in story["lead_titles"]]
+        self.assertEqual(titles[0], "Quake off Flores island region")
+        self.assertEqual(leads[0], str(story["rep_title"]))
+        self.assertIn("topples buildings", leads[0])
+        self.assertCountEqual(leads, titles)
+
+    def test_a_story_without_lead_titles_falls_back_to_its_members(self) -> None:
+        self.assertEqual(
+            _lead_titles({"titles": ["only member"]}),
+            ["only member"],
+        )
 
 
 class QuotaPackingTests(unittest.TestCase):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -70,6 +71,19 @@ _OUTLET_TOKENS = frozenset(
 
 _STOPWORDS = _STOPWORDS | _HOMONYM_VERBS | _OUTLET_TOKENS
 
+# Ranking cap on sheer member count. A seismograph bot files eighty
+# near-identical tremor lines a week; uncapped, that cluster scores 81 where a
+# four-major world story scores 24, and it opens the brief. Distinct majors
+# stay uncapped -- they are the half of the signal that cannot be spammed.
+_MEMBER_SCORE_CAP = 12
+
+# Document frequency is recomputed at most this often, over this much history.
+_DF_REFRESH = timedelta(hours=6)
+_DF_WINDOW = timedelta(days=14)
+# Below this many headlines the frequencies are too noisy to judge anything by,
+# so the gate stays open and clustering behaves exactly as it did before.
+_DF_MIN_TITLES = 500
+
 
 def tokenize(title: str) -> set[str]:
     return {
@@ -106,10 +120,16 @@ class ClusterEngine:
         burst_window_minutes: int,
         major_sources: list[str],
         embedder: TitleEmbedder | None = None,
+        min_shared_idf: float = 0.0,
+        max_age_hours: int = 48,
     ):
         self.store = store
         self.window_hours = window_hours
         self.min_shared = min_shared_tokens
+        self.min_shared_idf = min_shared_idf
+        self.max_age_hours = max_age_hours
+        self._df: tuple[dict[str, int], int] | None = None
+        self._df_at: datetime | None = None
         self.burst_min_majors = burst_min_majors
         self.burst_window = timedelta(minutes=burst_window_minutes)
         self._majors = tuple(name.casefold() for name in major_sources)
@@ -138,13 +158,23 @@ class ClusterEngine:
         if existing is not None:
             return int(existing["cluster_id"])
         cutoff = _iso(now - timedelta(hours=self.window_hours))
+        # last_at is refreshed by every join, so an activity-only window is a
+        # lease a cluster renews by absorbing: cluster 45 was founded on 14
+        # August and was still recruiting on the 21st, 315 members later,
+        # because it never went twelve quiet hours. Age is measured from the
+        # founding instead. A story that runs for a week is then a fresh
+        # cluster every couple of days, which is what a twice-daily brief
+        # wants anyway -- today's brief should be about today.
+        founded_after = _iso(now - timedelta(hours=self.max_age_hours))
         best_id: int | None = None
         best_key = (0, 0)
         best_tokens: list[str] = []
+        best_shared: set[str] = set()
         candidates: list[tuple[int, str, list[str]]] = []
         for row in connection.execute(
-            "SELECT id, tokens_json, title FROM story_cluster WHERE last_at >= ?",
-            (cutoff,),
+            "SELECT id, tokens_json, title FROM story_cluster "
+            "WHERE last_at >= ? AND created_at >= ?",
+            (cutoff, founded_after),
         ):
             cluster_tokens = json.loads(str(row["tokens_json"]))
             candidates.append((int(row["id"]), str(row["title"]), cluster_tokens))
@@ -155,16 +185,29 @@ class ClusterEngine:
             # how one earthquake swallowed a news day. The grown set still
             # ranks between equally-founded candidates.
             founding = tokenize(str(row["title"]))
-            key = (
-                len(tokens.intersection(founding)),
-                len(tokens.intersection(cluster_tokens)),
-            )
+            shared = tokens.intersection(founding)
+            key = (len(shared), len(tokens.intersection(cluster_tokens)))
             if key > best_key:
                 best_id = int(row["id"])
                 best_key = key
                 best_tokens = list(cluster_tokens)
+                best_shared = shared
         best_overlap = best_key[0]
-        if best_overlap < self.min_shared:
+        if best_id is not None and best_overlap >= self.min_shared:
+            mass = self._identity_mass(best_shared, now)
+            if mass is not None and mass < self.min_shared_idf:
+                # A genre, not a story. Refused outright rather than passed to
+                # the embedding rescue, because template headlines are exactly
+                # what scores highest there: handing it on would let the rescue
+                # overturn the judgement with the evidence that caused it.
+                LOGGER.info(
+                    "cluster_genre_rejected cluster=%s mass=%.2f shared=%s",
+                    best_id,
+                    mass,
+                    ",".join(sorted(best_shared)),
+                )
+                best_id = None
+        else:
             rescued = self._embedding_match(item.title, candidates)
             if rescued is not None:
                 best_id, best_tokens = rescued
@@ -208,6 +251,57 @@ class ClusterEngine:
         )
         connection.commit()
         return cluster_id
+
+    def _document_frequencies(self, now: datetime) -> tuple[dict[str, int], int] | None:
+        """How common each token is across recent headlines; None when unknown.
+
+        Counting shared tokens treats every word as equally identifying, and
+        that is measurably false. "Earnings call transcript: Freightways posts
+        strong H2 2026 results" and "Earnings call transcript: Iress lifts
+        profit outlook in H1 2026" share exactly {earnings, transcript, 2026}
+        -- three tokens, precisely the threshold -- and those three words built
+        a single cluster holding 300 unrelated earnings stories. What bridged
+        them is the vocabulary the whole genre uses. Across 14135 stored
+        headlines "earthquake" carries idf 1.35 and "transcript" 3.87, while
+        the words that actually name a story -- "freightways", "mindanao",
+        "viasat" -- carry 8.2 to 8.5.
+        """
+        if self._df_at is not None and now - self._df_at < _DF_REFRESH:
+            return self._df
+        rows = self.store.connection.execute(
+            "SELECT title FROM cluster_member WHERE added_at >= ?",
+            (_iso(now - _DF_WINDOW),),
+        ).fetchall()
+        self._df_at = now
+        if len(rows) < _DF_MIN_TITLES:
+            self._df = None
+            return None
+        counts: dict[str, int] = {}
+        for row in rows:
+            for token in tokenize(str(row["title"])):
+                counts[token] = counts.get(token, 0) + 1
+        self._df = (counts, len(rows))
+        return self._df
+
+    def _identity_mass(self, shared: set[str], now: datetime) -> float | None:
+        """How much identity two headlines actually share, in distinctive tokens.
+
+        Each token is scored by inverse document frequency and divided by
+        log(corpus), which puts a word nobody else uses at 1.0 and a word in
+        every other headline near 0.0. The sum therefore reads as "worth this
+        many wholly distinctive words" and means the same thing whether the
+        database holds five hundred headlines or half a million -- raw idf mass
+        would drift upward with the corpus and quietly retune the threshold.
+
+        None when the corpus is too small to judge, and every caller treats
+        None as "no opinion" -- a cold database clusters exactly as before.
+        """
+        stats = self._document_frequencies(now)
+        if stats is None:
+            return None
+        counts, total = stats
+        raw = sum(math.log(total / (1 + counts.get(token, 0))) for token in shared)
+        return raw / math.log(total)
 
     def _embedding_match(
         self, title: str, candidates: list[tuple[int, str, list[str]]]
@@ -336,9 +430,9 @@ class ClusterEngine:
             "WHERE c.last_at >= ? AND c.created_at < ? "
             "GROUP BY c.id "
             "HAVING member_count >= 2 OR major_count >= 1 "
-            "ORDER BY (major_count * 3 + member_count) DESC, c.id DESC "
+            "ORDER BY (major_count * 3 + min(member_count, ?)) DESC, c.id DESC "
             "LIMIT ?",
-            (_iso(start), _iso(end), limit),
+            (_iso(start), _iso(end), _MEMBER_SCORE_CAP, limit),
         ).fetchall()
         result: list[dict[str, object]] = []
         for row in rows:
@@ -367,11 +461,33 @@ class ClusterEngine:
                     "id": int(row["id"]),
                     "member_count": int(row["member_count"]),
                     "major_count": int(row["major_count"]),
-                    "score": int(row["major_count"]) * 3 + int(row["member_count"]),
+                    "score": int(row["major_count"]) * 3
+                    + min(int(row["member_count"]), _MEMBER_SCORE_CAP),
                     "promoted_at": row["promoted_at"],
                     "rep_title": str(representative["title"]),
                     "rep_source": str(representative["source"]),
                     "titles": [str(member["title"]) for member in members],
+                    # What the writer is shown, as opposed to what the gates
+                    # check. "titles" is ordered by publication time, so its
+                    # first five are the earliest filings: the thinnest wire
+                    # snaps, and in a large cluster often a different strand of
+                    # the story than the representative the rest of the entry
+                    # describes -- which is how a brief came to print an
+                    # Indonesian earthquake round-up above Ebola's sources.
+                    # The writer sees the representative first, then the
+                    # fullest major filings.
+                    "lead_titles": [str(representative["title"])]
+                    + [
+                        str(member["title"])
+                        for member in sorted(
+                            members,
+                            key=lambda member: (
+                                -int(member["is_major"]),
+                                -len(tokenize(str(member["title"]))),
+                            ),
+                        )
+                        if str(member["title"]) != str(representative["title"])
+                    ],
                     # Majors first, newest first: the brief links at most two
                     # and should link the outlets a reader recognises. Two
                     # stable sorts, because the key mixes a number to reverse
