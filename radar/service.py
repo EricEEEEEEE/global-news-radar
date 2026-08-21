@@ -15,6 +15,8 @@ from .briefs import BriefComposer
 from .clusters import ClusterEngine
 from .comic import ComicArtist
 from .delivery import TelegramDelivery, prune_outbox
+from .domains import DomainClassifier
+from .embeddings import TitleEmbedder
 from .models import AlertEvent, Assessment, NewsItem, RenderedMessage
 from .policy import (
     assess,
@@ -24,7 +26,7 @@ from .policy import (
     quiet_window_end,
     trending_assessment,
 )
-from .render import render_p0, render_p1
+from .render import render_brief_cover, render_p0, render_p1
 from .sources import (
     FmpCollector,
     GdeltCollector,
@@ -157,6 +159,16 @@ class RadarService:
             str(value).lower() for value in config["discovery"]["major_sources"]
         )
         clusters_config = dict(config.get("clusters") or {})
+        embedding_config = dict(clusters_config.get("embedding") or {})
+        self.embedder = TitleEmbedder(
+            enabled=_env_flag(
+                env,
+                "RADAR_EMBEDDING_ENABLED",
+                bool(embedding_config.get("enabled", False)),
+            ),
+            model_name=str(embedding_config.get("model") or ""),
+            threshold=float(embedding_config.get("threshold") or 0.7),
+        )
         self.clusters = ClusterEngine(
             self.store,
             window_hours=int(clusters_config.get("window_hours") or 12),
@@ -166,8 +178,10 @@ class RadarService:
             major_sources=[
                 str(value) for value in config["discovery"]["major_sources"]
             ],
+            embedder=self.embedder,
         )
         briefs_config = dict(config.get("briefs") or {})
+        domains_config = dict(config.get("domains") or {})
         self.briefs_enabled = _env_flag(
             env, "RADAR_BRIEFS_ENABLED", bool(briefs_config.get("enabled", False))
         )
@@ -182,9 +196,32 @@ class RadarService:
             or str(config["llm"]["model"] or ""),
             timeout=int(briefs_config.get("timeout_seconds") or 60),
             max_items=int(briefs_config.get("max_items") or 8),
-            max_visible_chars=int(briefs_config.get("max_visible_chars") or 950),
+            max_visible_chars=int(briefs_config.get("max_visible_chars") or 3500),
             morning_sgt=str(briefs_config.get("morning_sgt") or "07:30"),
             evening_sgt=str(briefs_config.get("evening_sgt") or "20:30"),
+            classifier=DomainClassifier(
+                enabled=_env_flag(
+                    env,
+                    "RADAR_DOMAINS_LLM_ENABLED",
+                    bool(domains_config.get("llm_enabled", False)),
+                ),
+                base_url=env.get("LLM_API_BASE") or env.get("FE_LLM_API_BASE", ""),
+                api_key=env.get("LLM_API_KEY") or env.get("FE_LLM_API_KEY", ""),
+                model=str(domains_config.get("model") or "")
+                or env.get("LLM_MODEL")
+                or env.get("FE_LLM_MODEL")
+                or str(config["llm"]["model"] or ""),
+                timeout=int(domains_config.get("timeout_seconds") or 30),
+            ),
+            quotas={
+                str(key): int(value)
+                for key, value in dict(domains_config.get("quotas") or {}).items()
+            },
+            source_hints={
+                str(key): str(value)
+                for key, value in dict(domains_config.get("source_hints") or {}).items()
+            },
+            candidate_multiplier=int(briefs_config.get("candidate_multiplier") or 5),
         )
         comic_config = dict(config.get("comic") or {})
         self.comic = ComicArtist(
@@ -1264,11 +1301,22 @@ class RadarService:
         if kind is None:
             return 0
         message, comic_entries = self.briefs.compose(kind, now)
-        photo = self.comic.generate(comic_entries) if self.briefs_comic else None
-        delivered = self._deliver_or_queue(
-            message, self.news_thread_id, now, photo=photo
-        )
+        delivered = self._deliver_or_queue(message, self.news_thread_id, now)
         self.briefs.mark_sent(kind, now)
+        # The picture follows as its own message. Riding along as a photo
+        # caption capped the entire brief at Telegram's 1024-character caption
+        # limit, so the text was being truncated to make room for decoration.
+        if delivered and self.briefs_comic:
+            photo = self.comic.generate(comic_entries)
+            if photo:
+                local_date = now.astimezone(SGT).date().isoformat()
+                cover = render_brief_cover(
+                    header=self.briefs.header(kind, now),
+                    event_key=f"brief-cover:{kind}:{local_date}",
+                    now=now,
+                    max_visible_chars=self.alert_visible_chars,
+                )
+                self._deliver_or_queue(cover, self.news_thread_id, now, photo=photo)
         LOGGER.info("brief_dispatched kind=%s delivered=%s", kind, delivered)
         return 1 if delivered else 0
 

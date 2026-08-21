@@ -398,48 +398,136 @@ def render_p1(
     )
 
 
+def _brief_links(sources: list[tuple[str, str]], max_sources: int = 2) -> str:
+    """Outlet names, hyperlinked where the URL is safe to link.
+
+    The alert path has always done this; the brief did not, so its lines were
+    unverifiable dead text. Tags and hrefs cost zero visible characters under
+    Telegram's counter, so attribution is free here.
+    """
+    links: list[str] = []
+    seen: set[str] = set()
+    for name, url in sources:
+        key = str(name).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        label = html.escape(_clip(str(name), 22))
+        if str(url).startswith("https://"):
+            label = f'<a href="{html.escape(str(url), quote=True)}">{label}</a>'
+        links.append(label)
+        if len(links) >= max_sources:
+            break
+    return " · ".join(links)
+
+
+def _render_brief_item(item: dict[str, Any]) -> str:
+    lead = f"<b>{html.escape(str(item.get('lead') or ''))}</b>"
+    note = html.escape(str(item.get("note") or "")).strip()
+    links = _brief_links(list(item.get("sources") or []))
+    tail = " · ".join(part for part in (note, links) if part)
+    return f"{lead}\n{tail}" if tail else lead
+
+
 def render_brief(
     *,
     header: str,
-    lines: list[str],
+    subtitle: str,
+    sections: list[dict[str, Any]],
+    replayed: list[str],
     footer: str,
     event_key: str,
     now: datetime,
     max_visible_chars: int,
 ) -> RenderedMessage:
-    """One daily-brief message: fixed header, bullet lines, stats footer.
+    """One daily-brief message, sectioned by domain.
 
-    Lines arrive pre-gated (numbers and bare English already checked) as plain
-    text. Overflow drops whole trailing lines so every surviving line stays
-    intact and attributable; a single oversized line is clipped, not failed.
+    The old shape was a single blockquote of identical bullets: nothing led,
+    nothing was attributable, and a reader could not tell an earthquake from
+    an earnings report without reading every line. Here each domain is its own
+    labelled block, each story leads with a bold line and follows with its
+    context and its sources, and the header carries the day's temperature.
+
+    Overflow degrades in the order that costs the least meaning: the replay of
+    already-sent alerts goes first, then trailing stories, then whole empty
+    sections, and only a lone oversized lead is ever clipped.
     """
     local_time = now.astimezone(SGT).strftime("%H:%M")
-    selected = [line for line in lines if line.strip()] or ["（本时段无条目）"]
+    working: list[dict[str, Any]] = [
+        {
+            "emoji": str(section.get("emoji") or ""),
+            "label": str(section.get("label") or ""),
+            "items": list(section.get("items") or []),
+        }
+        for section in sections
+    ]
+    quoted = [line for line in replayed if str(line).strip()]
 
-    def build(current: list[str]) -> str:
-        bullets = "\n".join(f"• {html.escape(line)}" for line in current)
-        return (
-            f"🌍 <b>{html.escape(header)}</b>\n"
-            f"<blockquote>{bullets}</blockquote>\n"
-            f"<i>{html.escape(footer)} · 雷达 {local_time} SGT</i>"
-        )
+    def total_items(current: list[dict[str, Any]]) -> int:
+        return sum(len(section["items"]) for section in current)
 
-    body = build(selected)
-    while len(selected) > 1 and visible_length(body) > max_visible_chars:
-        selected = selected[:-1]
-        body = build(selected)
-    if visible_length(body) > max_visible_chars:
-        overhead = visible_length(build([""]))
-        selected = [_clip(selected[0], max(24, max_visible_chars - overhead))]
-        body = build(selected)
+    def build(current: list[dict[str, Any]], replay: list[str]) -> str:
+        blocks = [f"🌍 <b>{html.escape(header)}</b>"]
+        if subtitle:
+            blocks.append(f"<i>{html.escape(subtitle)}</i>")
+        for section in current:
+            if not section["items"]:
+                continue
+            title = (
+                f"{html.escape(section['emoji'])} "
+                f"<b>{html.escape(section['label'])}</b>"
+            )
+            body_lines = "\n".join(
+                _render_brief_item(item) for item in section["items"]
+            )
+            blocks.append(f"{title}\n{body_lines}")
+        if replay:
+            bullets = "\n".join(f"• {html.escape(line)}" for line in replay)
+            blocks.append(f"已推提醒\n<blockquote>{bullets}</blockquote>")
+        if not current or total_items(current) == 0:
+            blocks.insert(1 if subtitle else 1, "（本时段无达到整理门槛的世界大事）")
+        blocks.append(f"<i>{html.escape(footer)} · 雷达 {local_time} SGT</i>")
+        return "\n\n".join(blocks)
+
+    body = build(working, quoted)
+    while quoted and visible_length(body) > max_visible_chars:
+        quoted.pop()
+        body = build(working, quoted)
+    while total_items(working) > 1 and visible_length(body) > max_visible_chars:
+        for section in reversed(working):
+            if section["items"]:
+                section["items"].pop()
+                break
+        working = [section for section in working if section["items"]]
+        body = build(working, quoted)
+    if visible_length(body) > max_visible_chars and total_items(working) == 1:
+        only = working[0]["items"][0]
+        overhead = visible_length(build([{**working[0], "items": [{"lead": ""}]}], []))
+        working[0]["items"] = [
+            {
+                "lead": _clip(
+                    str(only.get("lead") or ""), max(24, max_visible_chars - overhead)
+                )
+            }
+        ]
+        body = build(working, quoted)
     validate_html(body, max_visible_chars)
     digest = hashlib.md5(body.encode("utf-8")).hexdigest()  # nosec B324
+    leads = [
+        str(item.get("lead") or "") for section in working for item in section["items"]
+    ]
     visual_evidence: list[dict[str, str]] = [
         {
             "label": "条目数量",
-            "value": str(len(selected)),
+            "value": str(len(leads)),
             "role": "scalar",
             "source_path": "$.line_count",
+        },
+        {
+            "label": "分区数量",
+            "value": str(len([s for s in working if s["items"]])),
+            "role": "scalar",
+            "source_path": "$.section_count",
         },
         {
             "label": "生成时间",
@@ -448,11 +536,11 @@ def render_brief(
             "source_path": "$.rendered_at",
         },
     ]
-    for index, line in enumerate(selected):
+    for index, lead in enumerate(leads):
         visual_evidence.append(
             {
                 "label": f"条目 {index + 1}",
-                "value": line,
+                "value": lead,
                 "role": "status",
                 "source_path": f"$.lines[{index}]",
             }
@@ -460,7 +548,7 @@ def render_brief(
     visual_spec = _visual_spec(
         primary_question="过去半天世界发生了什么？",
         headline=header,
-        answer="；".join(selected[:4]),
+        answer="；".join(leads[:4]) or header,
         intent="digest",
         grammar="html-digest",
         roles=["scalar", "status", "time"],
@@ -472,9 +560,54 @@ def render_brief(
         plain_text=strip_html(body),
         event_keys=[event_key],
         content_hash=digest,
-        evidence=[{"line": line} for line in selected],
+        evidence=[{"line": lead} for lead in leads],
         created_at=now,
         visual_spec=visual_spec,
+    )
+
+
+def render_brief_cover(
+    *,
+    header: str,
+    event_key: str,
+    now: datetime,
+    max_visible_chars: int,
+) -> RenderedMessage:
+    """The caption that carries the brief's comic as its own message.
+
+    The comic used to ride on the brief itself, which capped the whole brief
+    at Telegram's 1024-character photo caption and silently dropped the image
+    whenever the text won. Splitting them lets the text use the full 4096 and
+    the picture arrive intact behind it.
+    """
+    local_time = now.astimezone(SGT).strftime("%H:%M")
+    body = f"🖼 <b>{html.escape(header)}</b>\n<i>今日速览图 · 雷达 {local_time} SGT</i>"
+    validate_html(body, max_visible_chars)
+    digest = hashlib.md5(body.encode("utf-8")).hexdigest()  # nosec B324
+    return RenderedMessage(
+        level="BRIEF",
+        html=body,
+        plain_text=strip_html(body),
+        event_keys=[event_key],
+        content_hash=digest,
+        evidence=[{"cover": header}],
+        created_at=now,
+        visual_spec=_visual_spec(
+            primary_question="今天的世界速览图",
+            headline=header,
+            answer=header,
+            intent="digest",
+            grammar="html-cover",
+            roles=["status"],
+            evidence=[
+                {
+                    "label": "标题",
+                    "value": header,
+                    "role": "status",
+                    "source_path": "$.header",
+                }
+            ],
+        ),
     )
 
 
