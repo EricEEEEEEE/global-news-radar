@@ -38,7 +38,7 @@ from radar.render import (
     render_p1,
     validate_html,
 )
-from radar.service import RadarService, check_health
+from radar.service import DEFAULT_USER_AGENT, RadarService, check_health
 from radar.sources import FmpCollector, GdeltCollector, HttpClient, discovery_queries
 from radar.store import RadarStore
 from radar.summarizer import LlmSummarizer, Summary, bare_english_spans
@@ -4219,6 +4219,14 @@ class FeedAcceptHeaderTests(unittest.TestCase):
             "text/xml",
         ):
             self.assertIn(media_type, accept)
+
+    def test_the_user_agent_carries_no_domain(self) -> None:
+        # CBC's edge resets the connection on any User-Agent containing a
+        # domain, so the courtesy repository URL cost us the feed entirely.
+        agent = DEFAULT_USER_AGENT
+        self.assertIn("global-news-radar/", agent)
+        self.assertNotIn("http", agent)
+        self.assertNotIn(".com", agent)
 
     def test_an_unusual_feed_type_is_not_refused_outright(self) -> None:
         # The catch-all is what keeps the next odd publisher from going dark

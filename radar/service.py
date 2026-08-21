@@ -55,6 +55,10 @@ from .util import (
 
 LOGGER = logging.getLogger(__name__)
 
+# Named and versioned, but carrying no domain -- see the note at the
+# HttpClient construction below for the publisher that refuses those.
+DEFAULT_USER_AGENT = f"global-news-radar/{__version__} (RSS reader; non-commercial)"
+
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
@@ -109,9 +113,14 @@ class RadarService:
         )
         self.store = RadarStore(root / "state" / "radar.sqlite3")
         self.client = HttpClient(
-            user_agent=env.get("RADAR_USER_AGENT")
-            or f"global-news-radar/{__version__} "
-            "(+https://github.com/EricEEEEEEE/global-news-radar)",
+            # The repository URL used to sit in this string as a courtesy
+            # contact. CBC's edge resets the connection on any User-Agent
+            # carrying a domain -- measured: the same request is 200 with
+            # "global-news-radar/1.8.0 (RSS reader; non-commercial)" and a
+            # bare TCP reset with the github.com form -- so the feed was dark
+            # while curl fetched it fine. The reader still names and versions
+            # itself; only the URL is gone.
+            user_agent=env.get("RADAR_USER_AGENT") or DEFAULT_USER_AGENT,
             attempts=int(config["runtime"]["source_retry_attempts"]),
         )
         self.rss = RssCollector(self.client, self.store)
