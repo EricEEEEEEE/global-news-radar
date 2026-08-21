@@ -14,7 +14,9 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+from .embeddings import TitleEmbedder
 from .models import NewsItem
 from .store import RadarStore
 from .util import json_dumps
@@ -41,6 +43,33 @@ _STOPWORDS = frozenset(
     """.split()
 )
 
+# Impact verbs the wires reuse across unrelated beats. "Quake strikes Japan"
+# and "Israel strikes Lebanon" share nothing but the verb, yet before this it
+# counted toward the shared-token threshold and bridged the two into one
+# cluster. Purely grammatical verbs join them: they never identify a story.
+_HOMONYM_VERBS = frozenset(
+    """
+    strike strikes struck hit hits hitting slam slams slammed blast blasts
+    rock rocks rocked shake shakes shaken spark sparks sparked target targets
+    targeted face faces facing see sees seen urge urges warn warns call calls
+    seek seeks unveil unveils reveal reveals announce announces launch
+    launches set sets take takes make makes come comes go goes hold holds
+    keep keeps leave leaves bring brings add adds get gets put puts
+    """.split()
+)
+
+# Outlet names that are never the subject of a story. Deliberately limited to
+# single unambiguous words: deriving these from the configured source list
+# would delete "China", "Post" and "Times" from every headline that means them.
+_OUTLET_TOKENS = frozenset(
+    """
+    reuters bloomberg cnbc marketwatch yonhap aljazeera jazeera kyodo
+    politico axios cnn bbc afp upi newsweek forbes barrons
+    """.split()
+)
+
+_STOPWORDS = _STOPWORDS | _HOMONYM_VERBS | _OUTLET_TOKENS
+
 
 def tokenize(title: str) -> set[str]:
     return {
@@ -50,6 +79,18 @@ def tokenize(title: str) -> set[str]:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
+
+
+def _member_source_id(member: Any) -> str:
+    """The feed id a cluster member came from, or "" when unrecoverable.
+
+    Stored inside item_json rather than its own column, so this stays a read
+    of existing rows: no migration, and pre-1.8.0 members simply return "".
+    """
+    try:
+        return str(json.loads(str(member["item_json"])).get("source_id") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class ClusterEngine:
@@ -64,6 +105,7 @@ class ClusterEngine:
         burst_min_majors: int,
         burst_window_minutes: int,
         major_sources: list[str],
+        embedder: TitleEmbedder | None = None,
     ):
         self.store = store
         self.window_hours = window_hours
@@ -71,6 +113,9 @@ class ClusterEngine:
         self.burst_min_majors = burst_min_majors
         self.burst_window = timedelta(minutes=burst_window_minutes)
         self._majors = tuple(name.casefold() for name in major_sources)
+        # Optional and fail-open: when absent or broken, clustering is exactly
+        # the token-overlap behaviour it has always been.
+        self.embedder = embedder
 
     def is_major(self, source: str) -> bool:
         folded = source.casefold()
@@ -94,18 +139,36 @@ class ClusterEngine:
             return int(existing["cluster_id"])
         cutoff = _iso(now - timedelta(hours=self.window_hours))
         best_id: int | None = None
-        best_overlap = 0
+        best_key = (0, 0)
         best_tokens: list[str] = []
+        candidates: list[tuple[int, str, list[str]]] = []
         for row in connection.execute(
-            "SELECT id, tokens_json FROM story_cluster WHERE last_at >= ?",
+            "SELECT id, tokens_json, title FROM story_cluster WHERE last_at >= ?",
             (cutoff,),
         ):
             cluster_tokens = json.loads(str(row["tokens_json"]))
-            overlap = len(tokens.intersection(cluster_tokens))
-            if overlap > best_overlap:
+            candidates.append((int(row["id"]), str(row["title"]), cluster_tokens))
+            # Match against the tokens of the *founding* headline, not the
+            # grown set. The grown set is a union, so a sprawling cluster
+            # accumulates vocabulary and starts matching stories that share
+            # nothing with the story it began as -- chain absorption, which is
+            # how one earthquake swallowed a news day. The grown set still
+            # ranks between equally-founded candidates.
+            founding = tokenize(str(row["title"]))
+            key = (
+                len(tokens.intersection(founding)),
+                len(tokens.intersection(cluster_tokens)),
+            )
+            if key > best_key:
                 best_id = int(row["id"])
-                best_overlap = overlap
+                best_key = key
                 best_tokens = list(cluster_tokens)
+        best_overlap = best_key[0]
+        if best_overlap < self.min_shared:
+            rescued = self._embedding_match(item.title, candidates)
+            if rescued is not None:
+                best_id, best_tokens = rescued
+                best_overlap = self.min_shared
         if best_id is not None and best_overlap >= self.min_shared:
             cluster_id = best_id
             # The token set grows with new phrasings but stays capped, and the
@@ -145,6 +208,30 @@ class ClusterEngine:
         )
         connection.commit()
         return cluster_id
+
+    def _embedding_match(
+        self, title: str, candidates: list[tuple[int, str, list[str]]]
+    ) -> tuple[int, list[str]] | None:
+        """Last-resort merge for stories that share meaning but not words.
+
+        "6.1 quake off Hokkaido" and "Tsunami advisory lifted for northern
+        Japan" are one story with almost no token overlap. Only ever adds a
+        merge that token overlap already declined, so switching the embedder
+        off restores the previous behaviour exactly.
+        """
+        if self.embedder is None or not self.embedder.available:
+            return None
+        best: tuple[float, int, list[str]] | None = None
+        for cluster_id, founding_title, cluster_tokens in candidates:
+            score = self.embedder.similarity(title, founding_title)
+            if score is None or score < self.embedder.threshold:
+                continue
+            if best is None or score > best[0]:
+                best = (score, cluster_id, list(cluster_tokens))
+        if best is None:
+            return None
+        LOGGER.info("cluster_embedding_merge cluster=%s score=%.3f", best[1], best[0])
+        return best[1], best[2]
 
     def burst_candidates(self, now: datetime) -> list[dict[str, object]]:
         """Unpromoted clusters where enough distinct majors filed in a burst.
@@ -256,25 +343,60 @@ class ClusterEngine:
         result: list[dict[str, object]] = []
         for row in rows:
             members = connection.execute(
-                "SELECT source, is_major, title, published_at "
+                "SELECT source, is_major, title, url, published_at, item_json "
                 "FROM cluster_member WHERE cluster_id = ? "
                 "ORDER BY published_at ASC",
                 (int(row["id"]),),
             ).fetchall()
             if not members:
                 continue
-            representative = next(
-                (member for member in members if int(member["is_major"])), members[0]
+            # The most informative filing, not the earliest. The first wire
+            # snap is the shortest ("Strong quake strikes off Japan"); a later
+            # major filing carries the toll, the place and the response, which
+            # is what a reader of a twice-daily brief actually needs.
+            representative = max(
+                members,
+                key=lambda member: (
+                    int(member["is_major"]),
+                    len(tokenize(str(member["title"]))),
+                    str(member["published_at"]),
+                ),
             )
             result.append(
                 {
                     "id": int(row["id"]),
                     "member_count": int(row["member_count"]),
                     "major_count": int(row["major_count"]),
+                    "score": int(row["major_count"]) * 3 + int(row["member_count"]),
                     "promoted_at": row["promoted_at"],
                     "rep_title": str(representative["title"]),
                     "rep_source": str(representative["source"]),
                     "titles": [str(member["title"]) for member in members],
+                    # Majors first, newest first: the brief links at most two
+                    # and should link the outlets a reader recognises. Two
+                    # stable sorts, because the key mixes a number to reverse
+                    # with a timestamp string that cannot be negated.
+                    "sources": [
+                        (str(member["source"]), str(member["url"]))
+                        for member in sorted(
+                            sorted(
+                                members,
+                                key=lambda member: str(member["published_at"]),
+                                reverse=True,
+                            ),
+                            key=lambda member: -int(member["is_major"]),
+                        )
+                    ],
+                    # Which feeds filed this story. Feeds that only ever cover
+                    # one domain (a quake wire, a sport desk) classify it more
+                    # reliably than its vocabulary does.
+                    "source_ids": sorted(
+                        {
+                            str(_member_source_id(member))
+                            for member in members
+                            if _member_source_id(member)
+                        }
+                    ),
                 }
             )
         return result

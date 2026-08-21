@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import requests
@@ -51,7 +52,15 @@ CATEGORY_IMPACTS = {
 _BARE_ENGLISH_RE = re.compile(r"[A-Za-z][A-Za-z0-9 .&'’-]{3,}")
 
 
-def bare_english_spans(text: str) -> list[str]:
+def _is_proper_noun(span: str) -> bool:
+    """Name-shaped: at most three words, every word capitalised."""
+    words = span.split()
+    if not words or len(words) > 3:
+        return False
+    return all(word[:1].isupper() for word in words)
+
+
+def bare_english_spans(text: str, known_names: Iterable[str] = ()) -> list[str]:
     """English names that are never glossed with Chinese anywhere in the text.
 
     "Visa（维萨）" is fine; "Clearmind Medicine将收购…" with no gloss in the
@@ -59,7 +68,14 @@ def bare_english_spans(text: str) -> list[str]:
     glosses a name once and uses it bare afterwards, so the unit is the name,
     not the occurrence. Callers joining fields must join with a newline: a
     space would fuse "…Lantheus" + "Curium…" into one phantom ASCII run.
+
+    ``known_names`` relaxes the gate for name-shaped spans that some source
+    headline actually printed — "Klarna", "Petro". It never admits invented
+    English, because the span must appear in the corpus the caller supplies,
+    and never admits a clause: "Klarna posts Q2 profit" is four words, so it
+    still fails. Alert callers pass nothing and keep the strict gate.
     """
+    corpus = "\n".join(str(name) for name in known_names).casefold()
     glossed: set[str] = set()
     seen: list[str] = []
     for match in _BARE_ENGLISH_RE.finditer(text or ""):
@@ -69,8 +85,11 @@ def bare_english_spans(text: str) -> list[str]:
         tail = text[match.end() :].lstrip()
         if tail.startswith("（") or tail.startswith("("):
             glossed.add(span)
-        else:
-            seen.append(span)
+            continue
+        if corpus and _is_proper_noun(span) and span.casefold() in corpus:
+            glossed.add(span)
+            continue
+        seen.append(span)
     return [
         span
         for span in seen

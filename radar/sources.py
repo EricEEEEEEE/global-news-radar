@@ -11,7 +11,7 @@ from defusedxml import ElementTree as SafeET
 
 from .models import NewsItem
 from .store import RadarStore
-from .util import parse_datetime, stable_hash
+from .util import parse_datetime, stable_hash, strip_source_suffix
 
 LOGGER = logging.getLogger(__name__)
 
@@ -130,13 +130,16 @@ class RssCollector:
                 continue
             item_source = _child_text(entry, "source") or source_name
             summary = _child_text(entry, "description", "summary", "content")
+            # Identity stays keyed on the raw title: recomputing it over a
+            # cleaned title would make every already-seen item look new on the
+            # first poll after deploy and replay the whole backlog as alerts.
             identity = stable_hash(
                 f"{source_id}|{_child_text(entry, 'guid', 'id') or link}|{title}", 24
             )
             result.append(
                 NewsItem(
                     identity=identity,
-                    title=title,
+                    title=strip_source_suffix(title, (item_source, source_name)),
                     url=link,
                     source=item_source,
                     source_id=source_id,
@@ -238,7 +241,7 @@ class GdeltCollector:
             result.append(
                 NewsItem(
                     identity=stable_hash(f"gdelt|{url}|{title}", 24),
-                    title=title,
+                    title=strip_source_suffix(title, (source,)),
                     url=url,
                     source=source,
                     source_id="gdelt",

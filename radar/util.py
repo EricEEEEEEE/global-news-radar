@@ -101,8 +101,61 @@ def canonicalize_url(url: str) -> str:
     return urlunsplit(("https", host, path, urlencode(sorted(query)), ""))
 
 
+# A trailing " - Outlet" / " | Outlet" tail. Kept deliberately narrow: no
+# separator inside the tail, so "Trump - Putin summit - Reuters" surrenders
+# only the last segment.
+_SOURCE_SUFFIX_RE = re.compile(r"\s+[-–—|]\s+([^-–—|]{2,60})\s*$")
+# Lowercase words that are legitimately part of an outlet name. Everything
+# else lowercase in the tail means the tail is prose, not a byline.
+_SUFFIX_CONNECTORS = {"of", "the", "and", "de", "la", "le", "du", "des", "for"}
+
+
+def _looks_like_outlet(tail: str) -> bool:
+    """True when the tail reads as a publication name rather than prose.
+
+    "Reuters", "The New York Times", "Voice of America" pass. "what we know",
+    "live updates", "explained" do not, so a headline whose own words follow a
+    dash keeps them.
+    """
+    words = tail.split()
+    if not words or len(words) > 5:
+        return False
+    alphabetic = [word for word in words if re.search(r"[A-Za-z]", word)]
+    if not alphabetic or len(alphabetic) != len(words):
+        return False
+    capitalized = [word for word in alphabetic if word[:1].isupper()]
+    if not capitalized:
+        return False
+    return all(
+        word in capitalized or word.lower() in _SUFFIX_CONNECTORS for word in alphabetic
+    )
+
+
+def strip_source_suffix(title: str, known_sources: Iterable[str] = ()) -> str:
+    """Drop the publisher byline Google News and most wires append to titles.
+
+    Three quarters of the corpus carries one, and it is pure noise for a
+    reader: it eats the character budget of a brief line, and it poisons
+    tokenisation, where "reuters" becomes a token shared by every unrelated
+    Reuters story. Removed only when the tail is recognisably an outlet, and
+    never when it would leave a stub behind.
+    """
+    text = str(title or "").strip()
+    match = _SOURCE_SUFFIX_RE.search(text)
+    if not match:
+        return text
+    tail = match.group(1).strip()
+    known = {
+        str(name).strip().casefold() for name in known_sources if str(name).strip()
+    }
+    if not (tail.casefold() in known or _looks_like_outlet(tail)):
+        return text
+    head = text[: match.start()].strip()
+    return head if len(head) >= 12 else text
+
+
 def normalize_title(title: str, source: str = "") -> str:
-    value = html.unescape(title).strip().lower()
+    value = strip_source_suffix(html.unescape(title).strip()).lower()
     if source:
         value = re.sub(
             rf"\s*[-–—|]\s*{re.escape(source.strip().lower())}\s*$",
