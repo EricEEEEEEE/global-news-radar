@@ -20,6 +20,7 @@ from radar.config import load_config
 from radar.delivery import TelegramDelivery
 from radar.domains import (
     DOMAIN_LABELS,
+    DomainClassifier,
     classify_keywords,
     classify_keywords_scored,
     group_sections,
@@ -3400,6 +3401,110 @@ class DomainClassificationTests(unittest.TestCase):
     def test_every_domain_label_is_translated(self) -> None:
         for _title, domain in self.CASES:
             self.assertIn(domain, DOMAIN_LABELS)
+
+
+class KeywordBoundaryTests(unittest.TestCase):
+    """Cues match at word boundaries, not as bare substrings.
+
+    Every headline shape below is taken from the live corpus, and every one of
+    them used to score a cue from an unrelated domain. Measured over 14135
+    stored headlines, "nfl" fired 197 times and never once on American
+    football: 124 of those were "inflation" and 27 were "conflict", so the two
+    biggest beats in the feed -- prices and war -- both carried a sport cue.
+    """
+
+    def test_acronym_cues_do_not_fire_inside_longer_words(self) -> None:
+        for title in (
+            "Fed holds rates steady as inflation cools",
+            "Death toll rises in the Sudan conflict",
+            "Weak ETF inflows stall the rally",
+            "Coinbase slips after the ruling",
+            "The prime minister briefly addressed reporters",
+        ):
+            with self.subTest(title=title):
+                self.assertNotEqual(classify_keywords(title), "sport")
+
+    def test_industrial_output_is_not_a_court_case(self) -> None:
+        # "trial" inside "industrial", 13 times in the corpus.
+        self.assertNotEqual(
+            classify_keywords("Industrial output falls 2% in June"), "society"
+        )
+
+    def test_marked_cues_still_reach_inside_compounds(self) -> None:
+        # A leading * in the table means the cue may sit inside a longer word.
+        # Without it "quake" stops reaching "earthquake" -- 3610 corpus hits --
+        # and a bare earthquake headline drops to a single cue, which is the
+        # confidence level at which hints and the LLM are allowed to overrule.
+        self.assertGreaterEqual(
+            classify_keywords_scored("Powerful earthquake hits Flores island")[1], 2
+        )
+        self.assertEqual(
+            classify_keywords("Israeli airstrike kills three in Lebanon"), "politics"
+        )
+
+    def test_word_start_matching_keeps_the_vocabulary_it_needs(self) -> None:
+        # Anchoring the start costs any cue that was silently living inside a
+        # longer word. Three were worth spelling out; "playoff" losing the
+        # "layoff" cue and "nonprofit" losing "profit" were corrections, not
+        # losses, so they are deliberately not restored.
+        self.assertEqual(
+            classify_keywords("Bipartisan senators press Trump on the cuts"), "politics"
+        )
+        self.assertEqual(
+            classify_keywords("Brazil holds course if Lula wins reelection"), "politics"
+        )
+        self.assertEqual(
+            classify_keywords("Hantavirus cases climb in three states"), "science"
+        )
+        self.assertNotEqual(
+            classify_keywords("Cape Verde reach the playoff final"), "economy"
+        )
+
+    def test_padded_cues_match_only_the_whole_word(self) -> None:
+        # " ai " is padded in the table because the bare stem would match aid,
+        # air and aim. Word-start anchoring alone is not enough here.
+        self.assertEqual(classify_keywords("Aid convoy reaches the border"), "politics")
+
+
+class DomainOverlayGateTests(unittest.TestCase):
+    """The LLM may label a headline the keywords could not, and no more."""
+
+    @staticmethod
+    def _classifier() -> DomainClassifier:
+        return DomainClassifier(
+            enabled=True,
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="test",
+            model="test-model",
+            timeout=5,
+        )
+
+    def test_overlay_labels_headlines_with_no_keyword_evidence(self) -> None:
+        title = "Trump envoy Kushner arrives in Israel after rare talks"
+        self.assertEqual(classify_keywords_scored(title)[1], 0)
+        classifier = self._classifier()
+        with mock.patch.object(DomainClassifier, "_ask", return_value=["politics"]):
+            self.assertEqual(classifier.classify([title]), ["politics"])
+
+    def test_overlay_cannot_overrule_well_evidenced_keywords(self) -> None:
+        # The live failure this gate exists for: the overlay filed "Colombia
+        # earthquake kills 111" under politics, and a brief that hides an
+        # earthquake in the politics section is the exact defect the sections
+        # were built to remove. resolve_domain already refuses to let a source
+        # hint win against two cues; the overlay now obeys the same law.
+        title = "Colombia earthquake kills 111 in strongest tremor in a century"
+        self.assertGreaterEqual(classify_keywords_scored(title)[1], 2)
+        classifier = self._classifier()
+        with mock.patch.object(DomainClassifier, "_ask", return_value=["politics"]):
+            self.assertEqual(classifier.classify([title]), ["disaster"])
+
+    def test_an_outage_leaves_every_baseline_untouched(self) -> None:
+        titles = ["Powerful earthquake hits Flores", "Bitcoin climbs 11%"]
+        classifier = self._classifier()
+        with mock.patch.object(
+            DomainClassifier, "_ask", side_effect=RuntimeError("gateway down")
+        ):
+            self.assertEqual(classifier.classify(titles), ["disaster", "economy"])
 
 
 class QuotaPackingTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 
@@ -59,12 +60,23 @@ DOMAIN_EMOJI = {
     "other": "🗂",
 }
 
-# Substring cues, matched against the lowercased headline. Substrings rather
-# than tokens so "earthquake"/"quake" and "evacuat(e|ion)" both land.
+# Cues matched against the lowercased headline. How each one is written says
+# where it may match, because plain substring matching was measurably wrong:
+# across 14135 stored headlines "nfl" fired 197 times without ever meaning
+# American football -- 124 "inflation", 27 "conflict", 29 "inflows" -- so every
+# price story and every war story carried a sport cue. Likewise "nba" inside
+# "coinbase" (50), "efl" inside "briefly", "trial" inside "industrial".
+#
+#   "evacuat"        starts a word, any suffix: evacuate, evacuation, evacuated
+#   " ai "           whole word only, because the stem also opens aid/air/aim
+#   "*quake"         may sit inside a longer word: earthquake, seaquake
+#
+# Bare is the default and the safe one. The starred form is rare on purpose:
+# it is the only form that can match a word nobody wrote.
 _KEYWORDS: dict[str, tuple[str, ...]] = {
     "disaster": (
         "earthquake",
-        "quake",
+        "*quake",
         "magnitude",
         "tsunami",
         "aftershock",
@@ -91,10 +103,12 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "politics": (
         "election",
+        "reelection",
+        "re-election",
         "vote",
         "ballot",
         "parliament",
-        "senate",
+        "senat",
         "congress",
         "coup",
         "sanction",
@@ -127,8 +141,8 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "occupation",
         # Conflict wires phrase the same event a dozen ways; without these the
         # single largest politics beat scored zero and fell through to "other".
-        "strike kills",
-        "strikes kill",
+        "*strike kills",
+        "*strikes kill",
         "air strike",
         "drone strike",
         "shelling",
@@ -190,7 +204,7 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "economy",
     ),
     "science": (
-        "virus",
+        "*virus",
         "outbreak",
         "pandemic",
         "vaccine",
@@ -255,6 +269,7 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "shooting",
         "murder",
         "prison",
+        "imprison",
         "immigration",
         "migrant",
         "refugee",
@@ -287,6 +302,7 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "soccer",
         "premier league",
         "nba",
+        "wnba",
         "tennis",
         "formula 1",
         " f1 ",
@@ -341,6 +357,23 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _cue_pattern(cue: str) -> re.Pattern[str]:
+    """Compile one cue according to how it is written in the table above."""
+    if cue.startswith("*"):
+        return re.compile(re.escape(cue[1:]))
+    core = cue.strip()
+    pattern = r"(?<![a-z0-9])" + re.escape(core)
+    if cue != core:
+        pattern += r"(?![a-z0-9])"
+    return re.compile(pattern)
+
+
+_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    domain: tuple(_cue_pattern(cue) for cue in cues)
+    for domain, cues in _KEYWORDS.items()
+}
+
+
 def classify_keywords_scored(title: str) -> tuple[str, int]:
     """Deterministic domain for one headline, plus how many cues backed it.
 
@@ -348,10 +381,10 @@ def classify_keywords_scored(title: str) -> tuple[str, int]:
     frequently an accident ("collapsed form" is not a disaster), while two or
     more is real evidence.
     """
-    text = f" {str(title or '').lower()} "
+    text = str(title or "").lower()
     scores: Counter[str] = Counter()
-    for domain, cues in _KEYWORDS.items():
-        hits = sum(1 for cue in cues if cue in text)
+    for domain, patterns in _PATTERNS.items():
+        hits = sum(1 for pattern in patterns if pattern.search(text))
         if hits:
             scores[domain] = hits
     if not scores:
@@ -431,8 +464,16 @@ class DomainClassifier:
         result = list(baseline)
         for index, label in enumerate(labels[: len(titles)]):
             cleaned = str(label or "").strip().lower()
-            if cleaned in DOMAIN_LABELS:
-                result[index] = cleaned
+            if cleaned not in DOMAIN_LABELS:
+                continue
+            # The same law resolve_domain applies to source hints: a guess may
+            # fill a blank, but it may not outrank evidence. Ungated, the
+            # overlay filed "Colombia earthquake kills 111" under politics --
+            # burying an earthquake in the politics section is precisely the
+            # failure the sections were built to remove.
+            if classify_keywords_scored(titles[index])[1] >= 2:
+                continue
+            result[index] = cleaned
         return result
 
     def _ask(self, titles: list[str]) -> list[str]:
