@@ -6,8 +6,8 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
   "defusedxml==0.7.1",
-  "PyYAML==6.0.2",
-  "requests==2.32.4",
+  "PyYAML==6.0.3",
+  "requests==2.34.2",
 ]
 
 [project.optional-dependencies]
